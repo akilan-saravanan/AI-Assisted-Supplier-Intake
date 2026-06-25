@@ -69,6 +69,10 @@
   <main>
     <div class="card">
 
+      <div class="card-header-row">
+        <button class="export-btn no-print" id="btnExport" type="button">⬇ Export PDF</button>
+      </div>
+
       <div class="card-top">
         <div class="ring-wrap">
           <svg viewBox="0 0 120 120">
@@ -84,28 +88,29 @@
         <div class="card-meta">
           <div id="cardName">—</div>
           <span class="tier-badge" id="tierBadge">—</span>
+          <span class="confidence-label" id="confidenceLabel"></span>
         </div>
       </div>
 
       <div class="dimensions">
         <div class="dim-row">
           <span class="dim-label">Financial health</span>
-          <div class="bar-track"><div class="bar-fill" id="barFinancial"></div></div>
+          <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barFinancial"></div></div></div>
           <span class="dim-val" id="valFinancial2"></span>
         </div>
         <div class="dim-row">
           <span class="dim-label">Audit history</span>
-          <div class="bar-track"><div class="bar-fill" id="barAudit"></div></div>
+          <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barAudit"></div></div></div>
           <span class="dim-val" id="valAudit2"></span>
         </div>
         <div class="dim-row">
           <span class="dim-label">Compliance status</span>
-          <div class="bar-track"><div class="bar-fill" id="barCompliance"></div></div>
+          <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barCompliance"></div></div></div>
           <span class="dim-val" id="valCompliance2"></span>
         </div>
         <div class="dim-row">
           <span class="dim-label">Geo &amp; ESG risk</span>
-          <div class="bar-track"><div class="bar-fill" id="barGeo"></div></div>
+          <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barGeo"></div></div></div>
           <span class="dim-val" id="valGeo2"></span>
         </div>
       </div>
@@ -122,6 +127,11 @@
 
       <div id="decisionBanner" class="decision-banner hidden"></div>
 
+      <div class="notes-field">
+        <label for="spocNotes">SPOC notes <span class="notes-optional">(optional)</span></label>
+        <textarea id="spocNotes" rows="3" placeholder="Add any context or caveats before recording your decision…"></textarea>
+      </div>
+
       <div class="action-row">
         <button class="action-btn btn-approve" id="btnApprove" type="button">Approve</button>
         <button class="action-btn btn-escalate" id="btnEscalate" type="button">Escalate</button>
@@ -137,6 +147,27 @@
 
 </div>
 
+<section class="history-section no-print">
+  <h2 class="history-heading">Decision History</h2>
+  <div id="historyWrap">
+    <p class="history-empty" id="historyEmpty">No decisions recorded yet.</p>
+    <table class="history-table hidden" id="historyTable">
+      <thead>
+        <tr>
+          <th>Supplier</th>
+          <th>Score</th>
+          <th>Risk tier</th>
+          <th>Decision</th>
+          <th>Notes</th>
+          <th>Timestamp</th>
+        </tr>
+      </thead>
+      <tbody id="historyBody"></tbody>
+    </table>
+  </div>
+</section>
+
+<div id="tooltip" class="dim-tooltip hidden" role="tooltip"></div>
 <script src="scoring.js"></script>
 </body>
 </html>

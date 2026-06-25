@@ -305,7 +305,6 @@ input[type="range"]::-webkit-slider-thumb:hover {
 }
 
 .bar-track {
-  flex: 1;
   height: 8px;
   background: #f1f5f9;
   border-radius: 99px;
@@ -375,6 +374,95 @@ input[type="range"]::-webkit-slider-thumb:hover {
 .rec-approve     { background: #dcfce7; color: #15803d; }
 .rec-conditional { background: #fef3c7; color: #b45309; }
 .rec-reject      { background: #fee2e2; color: #b91c1c; }
+
+/* ── EXPORT BUTTON ── */
+.card-header-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: -8px;
+}
+
+.export-btn {
+  background: #f8fafc;
+  border: 1.5px solid #e2e8f0;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #475569;
+  padding: 6px 13px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.export-btn:hover { background: #f1f5f9; border-color: #94a3b8; }
+
+/* ── CONFIDENCE INDICATOR ── */
+.confidence-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-top: 6px;
+  display: block;
+}
+
+.conf-high { color: #15803d; }
+.conf-mid  { color: #64748b; }
+.conf-low  { color: #b45309; }
+
+/* ── TOOLTIP ── */
+.dim-tooltip {
+  position: fixed;
+  background: #1e293b;
+  color: #f8fafc;
+  font-size: 12px;
+  padding: 7px 11px;
+  border-radius: 7px;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 9999;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+  max-width: 320px;
+  white-space: normal;
+  line-height: 1.45;
+}
+
+.dim-tooltip.hidden { display: none; }
+
+/* ── NOTES FIELD ── */
+.notes-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.notes-field label {
+  font-size: 13px;
+  font-weight: 500;
+  color: #475569;
+}
+
+.notes-optional {
+  font-weight: 400;
+  color: #94a3b8;
+}
+
+.notes-field textarea {
+  width: 100%;
+  padding: 10px 13px;
+  border: 1.5px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 13px;
+  color: #1e293b;
+  font-family: inherit;
+  resize: vertical;
+  outline: none;
+  transition: border-color 0.15s;
+  line-height: 1.5;
+  background: #fff;
+}
+
+.notes-field textarea:focus { border-color: #64748b; }
 
 /* ── DECISION BANNER ── */
 .decision-banner {
@@ -448,6 +536,101 @@ input[type="range"]::-webkit-slider-thumb:hover {
 
 .reset-btn:hover { color: #475569; }
 .reset-btn.hidden { display: none; }
+
+/* ── HISTORY LOG ── */
+.history-section {
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0 32px 40px;
+}
+
+.history-heading {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1e293b;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.history-empty {
+  font-size: 13px;
+  color: #94a3b8;
+  padding: 16px 0;
+}
+
+.history-empty.hidden { display: none; }
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.history-table.hidden { display: none; }
+
+.history-table th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #94a3b8;
+  padding: 8px 12px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.history-table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid #f1f5f9;
+  color: #334155;
+  vertical-align: top;
+}
+
+.history-table tbody tr:first-child td { background: #fafbfc; }
+
+.h-name  { font-weight: 600; color: #1e293b; }
+.h-score { font-weight: 700; color: #1e293b; font-size: 14px; }
+.h-note  { color: #475569; font-style: italic; max-width: 220px; }
+.h-ts    { color: #94a3b8; white-space: nowrap; }
+.h-empty { color: #cbd5e1; font-style: normal; }
+
+.history-decision {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 99px;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.dec-approve  { background: #dcfce7; color: #15803d; }
+.dec-escalate { background: #fef3c7; color: #b45309; }
+.dec-reject   { background: #fee2e2; color: #b91c1c; }
+
+/* ── BAR HOVER ZONE ── */
+.bar-hover-zone {
+  flex: 1;
+  padding: 8px 0;
+  cursor: crosshair;
+  display: flex;
+  align-items: center;
+}
+
+.bar-hover-zone .bar-track {
+  flex: 1;
+}
+
+/* ── PRINT ── */
+@media print {
+  .no-print { display: none !important; }
+  body { background: #fff; }
+  header { border: none; }
+  .layout { display: block; padding: 0; margin: 0; }
+  aside { display: none; }
+  main { width: 100%; }
+  .card { border: none; box-shadow: none; padding: 0; }
+}
 
 @media (max-width: 800px) {
   .layout {
