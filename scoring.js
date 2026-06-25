@@ -65,6 +65,7 @@ function updateCard() {
   document.getElementById('compositeScore').textContent = score;
   document.getElementById('tierBadge').textContent = t.label;
   document.getElementById('tierBadge').className = 'tier-badge ' + t.cls;
+  updateActionButtons(t.cls);
   document.getElementById('explainText').textContent = explain(score, f, a, c, g);
   document.getElementById('recLabel').textContent = rec.label;
   document.getElementById('recLabel').className = 'rec-pill ' + rec.cls;
@@ -112,6 +113,42 @@ function loadExample(idx) {
   });
 }
 
+function updateActionButtons(tierCls) {
+  const map = { 'tier-green': 'approve', 'tier-amber': 'escalate', 'tier-red': 'reject' };
+  const suggested = map[tierCls];
+  ['approve', 'escalate', 'reject'].forEach(action => {
+    const btn = document.getElementById('btn' + action.charAt(0).toUpperCase() + action.slice(1));
+    btn.classList.toggle('suggested', action === suggested);
+  });
+}
+
+function recordDecision(decision) {
+  const name = document.getElementById('cardName').textContent;
+  const now = new Date();
+  const ts = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const dateStr = now.toLocaleDateString([], { day: '2-digit', month: 'short', year: 'numeric' });
+
+  const banner = document.getElementById('decisionBanner');
+  banner.textContent = `Decision recorded: ${decision} — Supplier ${name} — ${dateStr}, ${ts}`;
+  banner.className = 'decision-banner banner-' + decision.toLowerCase();
+
+  ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => {
+    document.getElementById(id).disabled = true;
+  });
+  document.getElementById('btnReset').classList.remove('hidden');
+}
+
+function resetDecision() {
+  const banner = document.getElementById('decisionBanner');
+  banner.className = 'decision-banner hidden';
+  banner.textContent = '';
+
+  ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => {
+    document.getElementById(id).disabled = false;
+  });
+  document.getElementById('btnReset').classList.add('hidden');
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   ['supplierName', 'financial', 'audit', 'compliance', 'geo'].forEach(id => {
     document.getElementById(id).addEventListener('input', updateCard);
@@ -120,6 +157,11 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.example-btn').forEach((btn, i) => {
     btn.addEventListener('click', () => loadExample(i));
   });
+
+  document.getElementById('btnApprove').addEventListener('click', () => recordDecision('Approve'));
+  document.getElementById('btnEscalate').addEventListener('click', () => recordDecision('Escalate'));
+  document.getElementById('btnReject').addEventListener('click', () => recordDecision('Reject'));
+  document.getElementById('btnReset').addEventListener('click', resetDecision);
 
   loadExample(0);
 });
