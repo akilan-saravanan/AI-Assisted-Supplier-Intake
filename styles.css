@@ -464,6 +464,20 @@ input[type="range"]::-webkit-slider-thumb:hover {
 
 .notes-field textarea:focus { border-color: #64748b; }
 
+/* ── AI NOTICE ── */
+.ai-notice {
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  color: #b45309;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+.ai-notice.hidden { display: none !important; }
+#aiNotice[style*="display: none"] { display: none !important; }
+
 /* ── DECISION BANNER ── */
 .decision-banner {
   border-radius: 8px;
