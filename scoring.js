@@ -87,11 +87,21 @@ async function askOllama(prompt, signal) {
 
 async function fetchAiScore(f, a, c, g, signal) {
   const prompt =
-    `You are a supplier risk analyst. Given these four dimension scores out of 100: ` +
-    `Financial health: ${f}, Audit history: ${a}, Compliance status: ${c}, Geo & ESG risk: ${g}. ` +
-    `Return ONLY a valid JSON object with no explanation, no markdown, no backticks. ` +
-    `Just raw JSON like this: {"score": 74, "financial": 88, "audit": 82, "compliance": 85, "geo": 79}. ` +
-    `The composite score should reflect the overall supplier risk. Higher score = lower risk.`;
+    `You are a supplier risk analyst scoring a supplier for procurement onboarding. ` +
+    `Score this supplier based on these four dimensions, each already rated out of 100: ` +
+    `Financial health: ${f}/100, Audit history: ${a}/100, Compliance status: ${c}/100, Geo & ESG risk: ${g}/100. ` +
+    `\n\nCalculate the composite risk score using this weighting: ` +
+    `Financial health 35%, Audit history 25%, Compliance status 25%, Geo & ESG risk 15%. ` +
+    `\n\nCalibration examples so you understand the scale correctly: ` +
+    `\n- A supplier scoring 88/82/85/79 across the four dimensions is a STRONG supplier and should score in the high 70s to high 80s overall, NOT in the 50s or 60s.` +
+    `\n- A supplier scoring 60-65 across most dimensions is a MEDIUM-risk supplier and should score in the 50s to low 60s overall.` +
+    `\n- A supplier scoring below 35 across most dimensions is a HIGH-risk supplier and should score below 35 overall.` +
+    `\n\nDo not be more conservative than the weighted average suggests. High input scores should produce ` +
+    `a high composite score. Only deviate from a pure weighted average if there is a genuine red flag, such as ` +
+    `one dimension being dramatically lower than the others (a 30+ point gap) which could indicate hidden risk. ` +
+    `\n\nReturn ONLY a valid JSON object with no explanation, no markdown, no backticks, no commentary: ` +
+    `{"score": <number 0-100>, "financial": ${f}, "audit": ${a}, "compliance": ${c}, "geo": ${g}}.`;
+
   const raw = await askOllama(prompt, signal);
   const cleaned = raw.trim().replace(/```json|```/g, '').replace(/\\"/g, '"').trim();
   let parsed;
@@ -107,8 +117,19 @@ async function fetchAiScore(f, a, c, g, signal) {
   };
 
   const fallbackScore = compositeRuleBased(f, a, c, g);
+  let score = clamp(parsed.score, fallbackScore);
+
+  // Sanity guard: if the AI's score deviates wildly (more than 20 points) from the
+  // weighted baseline with no obvious red flag, pull it back toward the baseline.
+  const maxDim = Math.max(f, a, c, g);
+  const minDim = Math.min(f, a, c, g);
+  const hasRedFlag = (maxDim - minDim) >= 30;
+  if (!hasRedFlag && Math.abs(score - fallbackScore) > 20) {
+    score = Math.round((score + fallbackScore) / 2);
+  }
+
   return {
-    score:      clamp(parsed.score,      fallbackScore),
+    score,
     financial:  clamp(parsed.financial,  f),
     audit:      clamp(parsed.audit,      a),
     compliance: clamp(parsed.compliance, c),
