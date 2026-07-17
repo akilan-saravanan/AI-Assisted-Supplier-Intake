@@ -5,167 +5,227 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Supplier Risk Scoring</title>
   <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/docx@7.8.2/build/index.js"></script>
+  <script>
+    if (typeof pdfjsLib !== 'undefined') {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    }
+  </script>
 </head>
 <body>
 
-<header>
-  <div class="logo">SR</div>
-  <h1>Supplier Risk Scoring <span>— POC</span></h1>
-</header>
+<!-- ══ LANDING PAGE ══════════════════════════════════════════════════════════ -->
+<div id="landingPage">
+  <div class="landing-card">
+    <div class="landing-logo">SR</div>
+    <h1 class="landing-title">Supplier Risk Scoring</h1>
+    <p class="landing-sub">AI-powered supplier intake — upload documents to begin</p>
 
-<div class="layout">
+    <label class="landing-drop-zone" for="docUpload" id="landingDropZone">
+      <span class="landing-drop-icon">▲</span>
+      <span class="landing-drop-title">Drop supplier documents here or click to upload</span>
+      <span class="landing-drop-sub">Supports PDF and Word (.docx) — upload multiple documents at once</span>
+      <input type="file" id="docUpload" accept=".pdf,.docx" multiple />
+    </label>
 
-  <!-- LEFT: Form -->
-  <aside>
-    <div class="examples">
-      <button class="example-btn" type="button">Supplier A</button>
-      <button class="example-btn" type="button">Supplier B</button>
-      <button class="example-btn" type="button">Supplier C</button>
-    </div>
+    <div id="fileChipList" class="file-chip-list hidden"></div>
 
-    <div class="panel">
-      <div class="panel-title">Supplier Input</div>
+    <button id="beginBtn" class="begin-btn" disabled>Begin Assessment →</button>
 
-      <div class="field">
-        <label for="supplierName">Supplier name</label>
-        <input type="text" id="supplierName" placeholder="e.g. Acme Logistics Ltd" />
-      </div>
+    <span class="landing-manual-link" id="goManual">Or enter scores manually →</span>
+  </div>
+</div>
 
-      <div class="slider-group">
-        <div class="slider-header">
-          <span class="lbl">Financial health <span class="weight-tag">35%</span></span>
-          <span class="val" id="valFinancial">50</span>
+<!-- ══ MAIN SCREEN ═══════════════════════════════════════════════════════════ -->
+<div id="mainScreen" style="display:none">
+
+  <header>
+    <div class="logo">SR</div>
+    <h1>Supplier Risk Scoring <span>— POC</span></h1>
+    <button class="new-supplier-btn no-print" id="btnNewSupplier" type="button">＋ New supplier</button>
+  </header>
+
+  <div class="supplier-tabs-bar no-print" id="supplierTabsBar" style="display:none"></div>
+
+  <div class="layout">
+
+    <!-- LEFT: Sliders -->
+    <aside>
+      <div id="uploadStatus" class="upload-status-main"></div>
+
+      <div id="manualInputs">
+        <div class="panel">
+          <div class="panel-title">Supplier Input</div>
+
+          <div class="field">
+            <label for="supplierName">Supplier name</label>
+            <input type="text" id="supplierName" placeholder="e.g. Acme Logistics Ltd" />
+          </div>
+
+          <div class="slider-group">
+            <div class="slider-header">
+              <span class="lbl">Financial health <span class="weight-tag">35%</span></span>
+              <span class="val" id="valFinancial">0</span>
+            </div>
+            <input type="range" id="financial" min="0" max="100" value="0" />
+          </div>
+
+          <div class="slider-group">
+            <div class="slider-header">
+              <span class="lbl">Audit history <span class="weight-tag">25%</span></span>
+              <span class="val" id="valAudit">0</span>
+            </div>
+            <input type="range" id="audit" min="0" max="100" value="0" />
+          </div>
+
+          <div class="slider-group">
+            <div class="slider-header">
+              <span class="lbl">Compliance status <span class="weight-tag">25%</span></span>
+              <span class="val" id="valCompliance">0</span>
+            </div>
+            <input type="range" id="compliance" min="0" max="100" value="0" />
+          </div>
+
+          <div class="slider-group">
+            <div class="slider-header">
+              <span class="lbl">Geo &amp; ESG risk <span class="weight-tag">15%</span></span>
+              <span class="val" id="valGeo">0</span>
+            </div>
+            <input type="range" id="geo" min="0" max="100" value="0" />
+          </div>
         </div>
-        <input type="range" id="financial" min="0" max="100" value="50" />
       </div>
+    </aside>
 
-      <div class="slider-group">
-        <div class="slider-header">
-          <span class="lbl">Audit history <span class="weight-tag">25%</span></span>
-          <span class="val" id="valAudit">50</span>
+    <!-- RIGHT: Score card -->
+    <main>
+      <div class="card">
+
+        <div class="card-header-row">
+          <button class="export-btn no-print" id="btnExport" type="button">⬇ Export PDF</button>
         </div>
-        <input type="range" id="audit" min="0" max="100" value="50" />
-      </div>
 
-      <div class="slider-group">
-        <div class="slider-header">
-          <span class="lbl">Compliance status <span class="weight-tag">25%</span></span>
-          <span class="val" id="valCompliance">50</span>
+        <!-- Source documents -->
+        <div id="sourceDocs" class="source-docs hidden">
+          <span class="source-docs-label">Source documents</span>
+          <div id="sourceDocChips" class="source-doc-chips"></div>
         </div>
-        <input type="range" id="compliance" min="0" max="100" value="50" />
-      </div>
 
-      <div class="slider-group">
-        <div class="slider-header">
-          <span class="lbl">Geo &amp; ESG risk <span class="weight-tag">15%</span></span>
-          <span class="val" id="valGeo">50</span>
-        </div>
-        <input type="range" id="geo" min="0" max="100" value="50" />
-      </div>
-    </div>
-  </aside>
+        <div class="card-top">
+          <div class="ring-wrap">
+            <svg viewBox="0 0 120 120">
+              <circle class="ring-bg" cx="60" cy="60" r="54" />
+              <circle id="scoreRing" cx="60" cy="60" r="54" />
+            </svg>
+            <div class="ring-label">
+              <span class="score-num" id="compositeScore">—</span>
+              <span class="score-sub">/ 100</span>
+            </div>
+          </div>
 
-  <!-- RIGHT: Score card -->
-  <main>
-    <div class="card">
-
-      <div class="card-header-row">
-        <button class="export-btn no-print" id="btnExport" type="button">⬇ Export PDF</button>
-      </div>
-
-      <div class="card-top">
-        <div class="ring-wrap">
-          <svg viewBox="0 0 120 120">
-            <circle class="ring-bg" cx="60" cy="60" r="54" />
-            <circle id="scoreRing" cx="60" cy="60" r="54" />
-          </svg>
-          <div class="ring-label">
-            <span class="score-num" id="compositeScore">—</span>
-            <span class="score-sub">/ 100</span>
+          <div class="card-meta">
+            <div id="cardName">—</div>
+            <span class="tier-badge" id="tierBadge">—</span>
+            <span class="confidence-label" id="confidenceLabel"></span>
           </div>
         </div>
 
-        <div class="card-meta">
-          <div id="cardName">—</div>
-          <span class="tier-badge" id="tierBadge">—</span>
-          <span class="confidence-label" id="confidenceLabel"></span>
+        <div class="dimensions">
+          <div class="dim-row">
+            <span class="dim-label">Financial health</span>
+            <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barFinancial"></div></div></div>
+            <span class="dim-val" id="valFinancial2"></span>
+          </div>
+          <div class="dim-row">
+            <span class="dim-label">Audit history</span>
+            <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barAudit"></div></div></div>
+            <span class="dim-val" id="valAudit2"></span>
+          </div>
+          <div class="dim-row">
+            <span class="dim-label">Compliance status</span>
+            <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barCompliance"></div></div></div>
+            <span class="dim-val" id="valCompliance2"></span>
+          </div>
+          <div class="dim-row">
+            <span class="dim-label">Geo &amp; ESG risk</span>
+            <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barGeo"></div></div></div>
+            <span class="dim-val" id="valGeo2"></span>
+          </div>
         </div>
-      </div>
 
-      <div class="dimensions">
-        <div class="dim-row">
-          <span class="dim-label">Financial health</span>
-          <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barFinancial"></div></div></div>
-          <span class="dim-val" id="valFinancial2"></span>
+        <div class="explain-block">
+          <div class="explain-title">Why this score</div>
+          <p id="explainText">—</p>
         </div>
-        <div class="dim-row">
-          <span class="dim-label">Audit history</span>
-          <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barAudit"></div></div></div>
-          <span class="dim-val" id="valAudit2"></span>
+
+        <div class="rec-block">
+          <span class="rec-heading">Onboarding recommendation</span>
+          <span class="rec-pill" id="recLabel">—</span>
         </div>
-        <div class="dim-row">
-          <span class="dim-label">Compliance status</span>
-          <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barCompliance"></div></div></div>
-          <span class="dim-val" id="valCompliance2"></span>
+
+        <div id="decisionBanner" class="decision-banner hidden"></div>
+
+        <div class="notes-field">
+          <label for="spocNotes">SPOC notes <span class="notes-optional">(optional)</span></label>
+          <textarea id="spocNotes" rows="3" placeholder="Add any context or caveats before recording your decision…"></textarea>
         </div>
-        <div class="dim-row">
-          <span class="dim-label">Geo &amp; ESG risk</span>
-          <div class="bar-hover-zone"><div class="bar-track"><div class="bar-fill" id="barGeo"></div></div></div>
-          <span class="dim-val" id="valGeo2"></span>
+
+        <div class="action-row">
+          <button class="action-btn btn-approve" id="btnApprove" type="button">Approve</button>
+          <button class="action-btn btn-escalate" id="btnEscalate" type="button">Escalate</button>
+          <button class="action-btn btn-reject" id="btnReject" type="button">Reject</button>
         </div>
+
+        <div class="reset-row">
+          <button class="reset-btn hidden" id="btnReset" type="button">Reset decision</button>
+        </div>
+
       </div>
+    </main>
 
-      <div class="explain-block">
-        <div class="explain-title">Why this score</div>
-        <p id="explainText">—</p>
-      </div>
-
-      <div class="rec-block">
-        <span class="rec-heading">Onboarding recommendation</span>
-        <span class="rec-pill" id="recLabel">—</span>
-      </div>
-
-      <div id="decisionBanner" class="decision-banner hidden"></div>
-
-      <div class="notes-field">
-        <label for="spocNotes">SPOC notes <span class="notes-optional">(optional)</span></label>
-        <textarea id="spocNotes" rows="3" placeholder="Add any context or caveats before recording your decision…"></textarea>
-      </div>
-
-      <div class="action-row">
-        <button class="action-btn btn-approve" id="btnApprove" type="button">Approve</button>
-        <button class="action-btn btn-escalate" id="btnEscalate" type="button">Escalate</button>
-        <button class="action-btn btn-reject" id="btnReject" type="button">Reject</button>
-      </div>
-
-      <div class="reset-row">
-        <button class="reset-btn hidden" id="btnReset" type="button">Reset decision</button>
-      </div>
-
-    </div>
-  </main>
-
-</div>
-
-<section class="history-section no-print">
-  <h2 class="history-heading">Decision History</h2>
-  <div id="historyWrap">
-    <p class="history-empty" id="historyEmpty">No decisions recorded yet.</p>
-    <table class="history-table hidden" id="historyTable">
-      <thead>
-        <tr>
-          <th>Supplier</th>
-          <th>Score</th>
-          <th>Risk tier</th>
-          <th>Decision</th>
-          <th>Notes</th>
-          <th>Timestamp</th>
-        </tr>
-      </thead>
-      <tbody id="historyBody"></tbody>
-    </table>
   </div>
-</section>
+
+  <!-- Evidence panel: per-dimension strengths & concerns from documents -->
+  <div id="evidenceSection" class="evidence-section hidden">
+    <div class="section-bar">
+      <h2 class="section-heading">Document Evidence</h2>
+      <span class="evidence-note" id="evidenceNote"></span>
+    </div>
+    <div id="evidenceGrid" class="evidence-grid"></div>
+  </div>
+
+  <!-- Concerns report: aggregated, severity-sorted -->
+  <div id="concernsSection" class="concerns-section hidden">
+    <div class="section-bar">
+      <h2 class="section-heading">Concerns Report</h2>
+      <button id="btnExportLetter" class="export-letter-btn no-print" type="button">⬇ Export Concerns Letter (.docx)</button>
+    </div>
+    <div id="concernsList" class="concerns-list"></div>
+  </div>
+
+  <section class="history-section no-print">
+    <h2 class="history-heading">Decision History</h2>
+    <div id="historyWrap">
+      <p class="history-empty" id="historyEmpty">No decisions recorded yet.</p>
+      <table class="history-table hidden" id="historyTable">
+        <thead>
+          <tr>
+            <th>Supplier</th>
+            <th>Score</th>
+            <th>Risk tier</th>
+            <th>Decision</th>
+            <th>Notes</th>
+            <th>Timestamp</th>
+          </tr>
+        </thead>
+        <tbody id="historyBody"></tbody>
+      </table>
+    </div>
+  </section>
+
+</div><!-- #mainScreen -->
 
 <div id="tooltip" class="dim-tooltip hidden" role="tooltip"></div>
 <script src="scoring.js"></script>
