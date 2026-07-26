@@ -13,7 +13,7 @@ const DIM_META = [
 ];
 
 const OLLAMA_URL   = 'http://localhost:11434/api/generate';
-const OLLAMA_MODEL = 'mistral';
+const OLLAMA_MODEL = 'qwen3:4b';
 
 let currentAbortController = null;
 let debounceTimer = null;
@@ -25,6 +25,49 @@ let supplierTabs     = [];
 let currentTabIdx    = -1;
 let lastRenderData   = null;
 let currentEvidence  = null;  // evidence extracted from documents
+
+// ── localStorage persistence ──────────────────────────────────────────────────
+
+const LS_TABS   = 'srisk_tabs';
+const LS_ACTIVE = 'srisk_activeTab';
+
+function saveTabsToStorage() {
+  try {
+    localStorage.setItem(LS_TABS,   JSON.stringify(supplierTabs));
+    localStorage.setItem(LS_ACTIVE, String(currentTabIdx));
+  } catch {}
+}
+
+function loadTabsFromStorage() {
+  try {
+    const stored = localStorage.getItem(LS_TABS);
+    if (!stored) return;
+    const tabs = JSON.parse(stored);
+    if (!Array.isArray(tabs) || !tabs.length) return;
+    supplierTabs = tabs;
+    const saved = parseInt(localStorage.getItem(LS_ACTIVE), 10);
+    const idx   = Number.isFinite(saved) && saved >= 0 && saved < tabs.length ? saved : tabs.length - 1;
+    // Show main screen directly — no fade needed on page load
+    document.getElementById('landingPage').style.display = 'none';
+    const main = document.getElementById('mainScreen');
+    main.style.display = 'flex';
+    main.style.opacity = '1';
+    currentTabIdx = idx;
+    renderTabs();
+    loadTab(idx);
+  } catch (e) {
+    console.warn('[Storage] Failed to restore tabs:', e.message);
+  }
+}
+
+function clearAllTabs() {
+  if (!confirm('Clear all saved suppliers? This cannot be undone.')) return;
+  supplierTabs  = [];
+  currentTabIdx = -1;
+  try { localStorage.removeItem(LS_TABS); localStorage.removeItem(LS_ACTIVE); } catch {}
+  renderTabs();
+  goToLanding();
+}
 
 // ── Fallback (rule-based) helpers ─────────────────────────────────────────────
 
@@ -76,16 +119,24 @@ function confidence(f, a, c, g) {
 
 // ── Ollama API ────────────────────────────────────────────────────────────────
 
+function stripThinkTags(text) {
+  // Qwen3 wraps reasoning in <think>…</think> before the actual response.
+  // /no_think in the prompt suppresses it, but strip defensively too.
+  return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+}
+
 async function askOllama(prompt, signal) {
+  // Prepend /no_think so Qwen3 skips the reasoning preamble.
+  const fullPrompt = `/no_think\n${prompt}`;
   const res = await fetch(OLLAMA_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: OLLAMA_MODEL, prompt, stream: false }),
+    body: JSON.stringify({ model: OLLAMA_MODEL, prompt: fullPrompt, stream: false, keep_alive: '30m', options: { num_ctx: 8192 } }),
     signal,
   });
   if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
   const data = await res.json();
-  return data.response;
+  return stripThinkTags(data.response);
 }
 
 async function fetchAiScore(f, a, c, g, signal) {
@@ -177,7 +228,242 @@ async function extractTextFromDocx(file) {
   return result.value;
 }
 
-// ── Combined extraction (scores + evidence) ───────────────────────────────────
+// ── Boilerplate stripping ─────────────────────────────────────────────────────
+
+function stripBoilerplate(text) {
+  return text
+    .split('\n')
+    .filter(line => {
+      const t = line.trim();
+      if (!t) return true;
+      if (/^page\s+\d+\s+of\s+\d+$/i.test(t)) return false;
+      if (/^\d+\s*\/\s*\d+$/.test(t)) return false;
+      if (/^confidential(\s*[-–—]\s*page\s+\d+.*)?$/i.test(t)) return false;
+      if (/^proprietary\s+and\s+confidential$/i.test(t)) return false;
+      if (/^internal\s+use\s+only$/i.test(t)) return false;
+      if (/^draft$/i.test(t)) return false;
+      return true;
+    })
+    .join('\n');
+}
+
+// ── RAG: chunking ─────────────────────────────────────────────────────────────
+
+function isHeaderLine(line) {
+  const t = line.trim();
+  if (!t || t.length > 80) return false;
+  if (/^[A-Z][A-Z\s\d&/()\-]{3,}$/.test(t)) return true;    // ALL CAPS line
+  if (/^\d+(\.\d+)*\s+[A-Z]/.test(t)) return true;           // "3.2 Section Title"
+  if (/^[A-Z][^.!?]{3,60}:\s*$/.test(t)) return true;        // "Title case line:"
+  return false;
+}
+
+function chunkText(text, fileName, maxChunk = 750) {
+  const lines = text.split('\n');
+  const chunks = [];
+  let current = [];
+  let currentLen = 0;
+
+  const flush = () => {
+    const block = current.join('\n').trim();
+    if (block.length > 40) chunks.push({ text: block, fileName });
+    current = [];
+    currentLen = 0;
+  };
+
+  for (const line of lines) {
+    if (isHeaderLine(line) && current.length > 0) flush();
+    current.push(line);
+    currentLen += line.length + 1;
+    if (currentLen > maxChunk) flush();
+  }
+  flush();
+  return chunks;
+}
+
+// ── RAG: embeddings ───────────────────────────────────────────────────────────
+
+const EMBED_URL        = 'http://localhost:11434/api/embeddings';
+const EMBED_BATCH_URL  = 'http://localhost:11434/api/embed';
+const EMBED_MODEL      = 'nomic-embed-text';
+const OLLAMA_VERSION_URL = 'http://localhost:11434/api/version';
+
+let _batchEmbedSupported = null; // null = unchecked, true/false after first check
+
+async function checkBatchEmbedSupport() {
+  if (_batchEmbedSupported !== null) return _batchEmbedSupported;
+  try {
+    const res  = await fetch(OLLAMA_VERSION_URL);
+    const data = await res.json();
+    // /api/embed (batch) was added in Ollama 0.1.33
+    const match = (data.version || '').match(/^(\d+)\.(\d+)\.(\d+)/);
+    if (match) {
+      const [, major, minor, patch] = match.map(Number);
+      _batchEmbedSupported =
+        major > 0 || minor > 1 || (minor === 1 && patch >= 33);
+    } else {
+      _batchEmbedSupported = false;
+    }
+  } catch {
+    _batchEmbedSupported = false;
+  }
+  console.log(`[RAG] batch embed (/api/embed) supported: ${_batchEmbedSupported}`);
+  return _batchEmbedSupported;
+}
+
+async function embedText(text, signal) {
+  const res = await fetch(EMBED_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: EMBED_MODEL, prompt: text, keep_alive: '30m' }),
+    signal,
+  });
+  if (!res.ok) throw new Error(`Embed HTTP ${res.status}`);
+  const data = await res.json();
+  return data.embedding;
+}
+
+async function embedBatch(texts, signal) {
+  const res = await fetch(EMBED_BATCH_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: EMBED_MODEL, input: texts, keep_alive: '30m' }),
+    signal,
+  });
+  if (!res.ok) throw new Error(`Embed batch HTTP ${res.status}`);
+  const data = await res.json();
+  return data.embeddings; // number[][]
+}
+
+async function buildIndex(chunks, signal) {
+  const useBatch = await checkBatchEmbedSupport();
+
+  if (useBatch) {
+    console.log(`[RAG] embedding ${chunks.length} chunks via batch /api/embed`);
+    const embeddings = await embedBatch(chunks.map(c => c.text), signal);
+    return chunks.map((chunk, i) => ({ ...chunk, embedding: embeddings[i] }));
+  }
+
+  console.log(`[RAG] embedding ${chunks.length} chunks sequentially (fallback)`);
+  const index = [];
+  for (const chunk of chunks) {
+    const embedding = await embedText(chunk.text, signal);
+    index.push({ ...chunk, embedding });
+  }
+  return index;
+}
+
+// ── RAG: retrieval ────────────────────────────────────────────────────────────
+
+function cosineSimilarity(a, b) {
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot  += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB) || 1);
+}
+
+function retrieveTopK(queryEmbedding, index, k = 3) {
+  return index
+    .map(item => ({ ...item, sim: cosineSimilarity(queryEmbedding, item.embedding) }))
+    .sort((a, b) => b.sim - a.sim)
+    .slice(0, k);
+}
+
+// ── RAG: per-dimension extraction ─────────────────────────────────────────────
+
+const DIM_QUERIES = {
+  financial:  'revenue profit loss debt credit rating cash flow financial statements accounts receivable',
+  audit:      'audit findings non-conformances corrective actions third-party audit certification ISO',
+  compliance: 'regulatory compliance certifications fines sanctions enforcement HSE permits licence',
+  geo:        'country of operation ESG environmental sustainability human rights supply chain risk geopolitical',
+};
+
+async function extractDimWithRAG(dimId, dimLabel, index, signal) {
+  const queryEmbedding = await embedText(DIM_QUERIES[dimId], signal);
+  const topChunks = retrieveTopK(queryEmbedding, index, 4);
+  const context = topChunks.map(c => `[${c.fileName}]\n${c.text}`).join('\n\n---\n\n');
+
+  const prompt =
+    `You are a supplier risk analyst. Using ONLY the excerpts below, assess the supplier's ${dimLabel}.\n\n` +
+    `Return ONLY valid JSON, no markdown:\n` +
+    `{"score":75,"strengths":["specific finding (filename)"],"concerns":["specific finding (filename)"]}\n\n` +
+    `Rules:\n` +
+    `- Score 0-100. Negative signals (fines, losses, failed audits) → low (<40). Positive signals → high (>70). No relevant data → 50.\n` +
+    `- Each finding must quote or closely paraphrase text actually present in the excerpts.\n` +
+    `- Include the filename in parentheses after each finding.\n` +
+    `- Maximum 4 items each. Use [] if none found. Do NOT invent findings.\n\n` +
+    `Excerpts:\n${context}`;
+
+  console.log(`[RAG:${dimId}] estimated prompt tokens:`, Math.ceil(prompt.length / 4));
+  const raw = await askOllama(prompt, signal);
+  const cleaned = raw.trim().replace(/```json|```/g, '').replace(/\\"/g, '"').trim();
+  return JSON.parse(cleaned);
+}
+
+async function extractNameWithRAG(index, signal) {
+  const queryEmbedding = await embedText('company name supplier organization legal entity registered name', signal);
+  const topChunks = retrieveTopK(queryEmbedding, index, 2);
+  const context = topChunks.map(c => c.text).join('\n\n');
+  const prompt =
+    `From these document excerpts, extract the company or supplier name.\n` +
+    `Return ONLY the company name as a plain string, nothing else. If not found, return: Unknown\n\n${context}`;
+  const raw = await askOllama(prompt, signal);
+  return raw.trim().replace(/^["']|["']$/g, '');
+}
+
+async function extractWithRAG(rawTexts, signal) {
+  const t0 = performance.now();
+
+  showLoader(`Building document chunks…`);
+  const allChunks = [];
+  for (const { text, fileName } of rawTexts) {
+    const stripped = stripBoilerplate(text);
+    allChunks.push(...chunkText(stripped, fileName));
+  }
+  console.log(`[RAG] total chunks: ${allChunks.length}`);
+
+  showLoader(`Embedding ${allChunks.length} chunks…`);
+  const t1 = performance.now();
+  const index = await buildIndex(allChunks, signal);
+  console.log(`[RAG] embedding done in ${((performance.now() - t1) / 1000).toFixed(1)}s`);
+
+  showLoader('Extracting company name + all dimensions (parallel)…');
+  const t2 = performance.now();
+
+  const dims = [
+    { id: 'financial',  label: 'Financial Health'  },
+    { id: 'audit',      label: 'Audit History'      },
+    { id: 'compliance', label: 'Compliance Status'  },
+    { id: 'geo',        label: 'Geo & ESG Risk'     },
+  ];
+
+  const [name, ...dimResults] = await Promise.all([
+    extractNameWithRAG(index, signal),
+    ...dims.map(({ id, label }) =>
+      extractDimWithRAG(id, label, index, signal).catch(() => ({
+        score: 50, strengths: [], concerns: [],
+      }))
+    ),
+  ]);
+
+  console.log(`[RAG] generation done in ${((performance.now() - t2) / 1000).toFixed(1)}s`);
+  console.log(`[RAG] total assessment time: ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+
+  const result = { name };
+  dims.forEach(({ id }, i) => {
+    const dr = dimResults[i];
+    result[id]                = Number.isFinite(dr.score) ? dr.score : 50;
+    result[id + '_strengths'] = Array.isArray(dr.strengths) ? dr.strengths : [];
+    result[id + '_concerns']  = Array.isArray(dr.concerns)  ? dr.concerns  : [];
+  });
+
+  return result;
+}
+
+// ── Combined extraction (scores + evidence) — fallback when embeddings unavailable ──
 
 async function extractScoresAndEvidence(combinedText) {
   const prompt =
@@ -307,6 +593,10 @@ function renderConcernsReport(concerns) {
   }
 
   section.classList.remove('hidden');
+  list.innerHTML = '';
+
+  const tab      = currentTabIdx >= 0 ? supplierTabs[currentTabIdx] : null;
+  const addressed = (tab && tab.addressedConcerns) || {};
 
   const sevMeta = {
     HIGH:   { cls: 'sev-high',   label: 'HIGH'   },
@@ -314,17 +604,44 @@ function renderConcernsReport(concerns) {
     LOW:    { cls: 'sev-low',    label: 'LOW'    },
   };
 
-  list.innerHTML = concerns.map(c => {
-    const sm = sevMeta[c.severity];
-    return `
-      <div class="concern-row">
-        <span class="sev-badge ${sm.cls}">${sm.label}</span>
-        <div class="concern-body">
-          <span class="concern-dim">${escHtml(c.dimension)}</span>
-          <span class="concern-text">${escHtml(c.text)}</span>
-        </div>
-      </div>`;
-  }).join('');
+  concerns.forEach(c => {
+    const sm   = sevMeta[c.severity];
+    const key  = concernKey(c.text);
+    const done = !!addressed[key];
+
+    const row = document.createElement('div');
+    row.className    = `concern-row${done ? ' addressed' : ''}`;
+    row.dataset.key  = key;
+
+    const badge = document.createElement('span');
+    badge.className   = `sev-badge ${sm.cls}`;
+    badge.textContent = sm.label;
+
+    const body = document.createElement('div');
+    body.className = 'concern-body';
+    body.innerHTML =
+      `<span class="concern-dim">${escHtml(c.dimension)}</span>` +
+      `<span class="concern-text">${escHtml(c.text)}</span>` +
+      (done ? `<span class="concern-addressed-ts">Addressed ${escHtml(addressed[key].ts)}</span>` : '');
+
+    let action;
+    if (done) {
+      action = document.createElement('span');
+      action.className   = 'concern-addressed-check';
+      action.textContent = '✓';
+    } else {
+      action = document.createElement('button');
+      action.className   = 'mark-one-btn';
+      action.type        = 'button';
+      action.textContent = 'Mark addressed';
+      action.addEventListener('click', () => markConcernAddressed(c, key));
+    }
+
+    row.append(badge, body, action);
+    list.appendChild(row);
+  });
+
+  refreshConcernsBadge();
 }
 
 // ── Concerns letter export (.docx) ────────────────────────────────────────────
@@ -592,14 +909,19 @@ function renderTabs() {
   if (!supplierTabs.length) { bar.style.display = 'none'; return; }
   bar.style.display = '';
   bar.innerHTML = supplierTabs.map((tab, i) => {
-    const dotCls = { 'tier-green': 'dot-green', 'tier-amber': 'dot-amber', 'tier-red': 'dot-red' }[tab.tierCls] || 'dot-grey';
-    const active = i === currentTabIdx ? ' active' : '';
+    const dotCls    = { 'tier-green': 'dot-green', 'tier-amber': 'dot-amber', 'tier-red': 'dot-red' }[tab.tierCls] || 'dot-grey';
+    const active    = i === currentTabIdx ? ' active' : '';
+    const addrCount = Object.keys(tab.addressedConcerns || {}).length;
+    const addrBadge = addrCount > 0
+      ? `<span class="tab-addressed-badge" title="${addrCount} concern${addrCount > 1 ? 's' : ''} addressed">${addrCount}</span>` : '';
     return `<button class="sup-tab${active}" data-idx="${i}">` +
-      `<span class="sup-tab-dot ${dotCls}"></span>${escHtml(tab.name)}</button>`;
-  }).join('');
+      `<span class="sup-tab-dot ${dotCls}"></span>${escHtml(tab.name)}${addrBadge}</button>`;
+  }).join('') +
+  `<button class="clear-tabs-btn no-print" id="btnClearAllTabs" type="button">Clear all</button>`;
   bar.querySelectorAll('.sup-tab').forEach(btn => {
     btn.addEventListener('click', () => loadTab(+btn.dataset.idx));
   });
+  document.getElementById('btnClearAllTabs').addEventListener('click', clearAllTabs);
 }
 
 function loadTab(idx) {
@@ -622,11 +944,18 @@ function loadTab(idx) {
   renderCard({ name: tab.name, score: tab.score, subScores: tab.subScores, explainText: tab.explainText, f: tab.f, a: tab.a, c: tab.c, g: tab.g });
 
   const banner = document.getElementById('decisionBanner');
-  banner.textContent = tab.bannerText;
-  banner.className   = 'decision-banner banner-' + tab.decision.toLowerCase();
+  if (tab.decision) {
+    banner.textContent = tab.bannerText || '';
+    banner.className   = 'decision-banner banner-' + tab.decision.toLowerCase();
+    ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => { document.getElementById(id).disabled = true; });
+    document.getElementById('btnReset').classList.remove('hidden');
+  } else {
+    banner.textContent = '';
+    banner.className   = 'decision-banner hidden';
+    ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => { document.getElementById(id).disabled = false; });
+    document.getElementById('btnReset').classList.add('hidden');
+  }
 
-  ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => { document.getElementById(id).disabled = true; });
-  document.getElementById('btnReset').classList.remove('hidden');
   document.getElementById('spocNotes').value = tab.notes || '';
   document.getElementById('uploadStatus').textContent = '';
 
@@ -648,11 +977,21 @@ function loadTab(idx) {
 
 function addOrUpdateTab(tabData) {
   if (currentTabIdx === -1) {
+    if (!tabData.id) tabData.id = Date.now().toString();
     supplierTabs.push(tabData);
     currentTabIdx = supplierTabs.length - 1;
   } else {
-    supplierTabs[currentTabIdx] = tabData;
+    // Merge so fields not in tabData (e.g. concernsAddressed) are preserved
+    supplierTabs[currentTabIdx] = { ...supplierTabs[currentTabIdx], ...tabData };
   }
+  saveTabsToStorage();
+  renderTabs();
+}
+
+function saveCurrentTab(data) {
+  if (currentTabIdx < 0 || currentTabIdx >= supplierTabs.length) return;
+  supplierTabs[currentTabIdx] = { ...supplierTabs[currentTabIdx], ...data };
+  saveTabsToStorage();
   renderTabs();
 }
 
@@ -702,6 +1041,7 @@ function resetMainScreen() {
 
   renderSourceDocs([]);
   setAiNotice(false);
+  hideLoader();
   document.getElementById('evidenceSection').classList.add('hidden');
   document.getElementById('concernsSection').classList.add('hidden');
   lastRenderData = null;
@@ -747,7 +1087,7 @@ async function handleBeginAssessment() {
   beginBtn.disabled    = true;
   beginBtn.textContent = 'Extracting…';
 
-  const parts = [];
+  const rawTexts = [];
   for (let i = 0; i < uploadedFiles.length; i++) {
     const file = uploadedFiles[i];
     const ext  = file.name.split('.').pop().toLowerCase();
@@ -756,14 +1096,7 @@ async function handleBeginAssessment() {
       if (ext === 'pdf')       text = await extractTextFromPdf(file);
       else if (ext === 'docx') text = await extractTextFromDocx(file);
     } catch { /* skip unreadable */ }
-
-    if (text.trim()) {
-      const trimmed = text.trim();
-      const chunk   = trimmed.length > 4000
-        ? trimmed.slice(0, 2000) + '\n\n[... middle section omitted ...]\n\n' + trimmed.slice(-2000)
-        : trimmed;
-      parts.push(`=== DOCUMENT ${i + 1}: ${file.name} ===\n${chunk}`);
-    }
+    if (text.trim()) rawTexts.push({ text: text.trim(), fileName: file.name });
   }
 
   goToMain();
@@ -771,30 +1104,45 @@ async function handleBeginAssessment() {
   renderSourceDocs(fileNames);
 
   const statusEl = document.getElementById('uploadStatus');
-  statusEl.textContent = `Reading ${fileNames.length} document${fileNames.length > 1 ? 's' : ''}…`;
-
   beginBtn.disabled    = false;
   beginBtn.textContent = 'Begin Assessment →';
 
-  if (!parts.length) {
+  if (!rawTexts.length) {
+    errorLoader('Could not read any documents — please check the file format and try again.');
     statusEl.textContent = 'Could not read any documents — enter scores manually.';
     return;
   }
 
-  statusEl.textContent = 'Extracting scores and evidence with AI…';
-  const combinedText = parts.join('\n\n');
+  showLoader(`Reading ${fileNames.length} document${fileNames.length > 1 ? 's' : ''}…`);
+  statusEl.textContent = `Extracting scores and evidence with AI…`;
 
   let parsed;
   try {
-    parsed = await extractScoresAndEvidence(combinedText);
-  } catch (err) {
-    console.warn('[Evidence extraction failed, falling back to scores-only]', err.message);
-    // Fall back to scores-only extraction
+    parsed = await extractWithRAG(rawTexts, null);
+  } catch (ragErr) {
+    console.warn('[RAG failed, trying full-text fallback]', ragErr.message);
+    showLoader('RAG unavailable — trying full-text extraction…');
+    const combinedText = rawTexts
+      .map((r, i) => {
+        const t = r.text;
+        const chunk = t.length > 4000
+          ? t.slice(0, 2000) + '\n\n[... middle omitted ...]\n\n' + t.slice(-2000)
+          : t;
+        return `=== DOCUMENT ${i + 1}: ${r.fileName} ===\n${chunk}`;
+      })
+      .join('\n\n');
     try {
-      parsed = await extractScoresOnly(combinedText);
-    } catch {
-      statusEl.textContent = 'AI unavailable — enter scores manually.';
-      return;
+      parsed = await extractScoresAndEvidence(combinedText);
+    } catch (err) {
+      console.warn('[Full-text extraction failed, falling back to scores-only]', err.message);
+      showLoader('Full extraction failed — retrying with simplified scoring…');
+      try {
+        parsed = await extractScoresOnly(combinedText);
+      } catch {
+        errorLoader('AI unavailable — Ollama may not be running. Enter scores manually.');
+        statusEl.textContent = 'AI unavailable — enter scores manually.';
+        return;
+      }
     }
   }
 
@@ -831,6 +1179,29 @@ async function handleBeginAssessment() {
       `Scores extracted from ${fileNames.length} document${fileNames.length > 1 ? 's' : ''}. Adjust sliders if needed.`;
   }
 
+  hideLoader();
+
+  // Create the tab entry now so it exists before AI scoring updates it.
+  // resetMainScreen() already set currentTabIdx = -1, ensuring addOrUpdateTab pushes
+  // a new entry rather than overwriting an existing supplier's tab.
+  const initialScore = compositeRuleBased(f, a, c, g);
+  currentTabIdx = -1; // explicit guard: never overwrite an existing tab on new assessment
+  addOrUpdateTab({
+    name:             (parsed.name || '').trim() || 'Unnamed Supplier',
+    score:            initialScore,
+    tierCls:          tier(initialScore).cls,
+    f, a, c, g,
+    sourceDocs:       [...fileNames],
+    evidence:         currentEvidence ? { ...currentEvidence } : null,
+    subScores:        null,
+    explainText:      '',
+    decision:         null,
+    notes:            '',
+    bannerText:       '',
+    fullTs:           '',
+    addressedConcerns: {},
+  });
+
   uploadedFiles = [];
   updateCard();
 }
@@ -853,6 +1224,25 @@ function setLoading(on) {
     document.getElementById('compositeScore').textContent = '…';
     document.getElementById('explainText').textContent    = 'Analysing with AI…';
   }
+}
+
+// ── Loading indicator ─────────────────────────────────────────────────────────
+
+function showLoader(msg) {
+  const el = document.getElementById('loadingIndicator');
+  el.classList.remove('hidden', 'loading-error');
+  document.getElementById('loadingText').textContent = msg;
+}
+
+function hideLoader() {
+  document.getElementById('loadingIndicator').classList.add('hidden');
+}
+
+function errorLoader(msg) {
+  const el = document.getElementById('loadingIndicator');
+  el.classList.remove('hidden');
+  el.classList.add('loading-error');
+  document.getElementById('loadingText').textContent = msg;
 }
 
 function setAiNotice(show) {
@@ -969,25 +1359,37 @@ async function runUpdate() {
   }
 
   setLoading(true);
+  showLoader('Generating AI risk score…');
 
   try {
     const scoreData = await fetchAiScore(f, a, c, g, signal);
     if (signal.aborted) return;
 
+    showLoader('Generating explanation…');
     const t = tier(scoreData.score);
     const explainText = await fetchAiExplain(f, a, c, g, scoreData.score, t.label, signal);
     if (signal.aborted) return;
 
+    hideLoader();
     setAiNotice(false);
     renderCard({ name, score: scoreData.score, subScores: scoreData, explainText: explainText.trim(), f, a, c, g });
+    saveCurrentTab({
+      name, score: scoreData.score,
+      tierCls:    tier(scoreData.score).cls,
+      subScores:  scoreData,
+      explainText: explainText.trim(),
+      f, a, c, g,
+    });
 
   } catch (err) {
     if (signal.aborted) return;
     console.warn('[AI] Falling back to rule-based:', err.message);
+    errorLoader('AI unavailable — showing rule-based score');
     const score       = compositeRuleBased(f, a, c, g);
     const explainText = explainRuleBased(score, f, a, c, g);
     setAiNotice(true);
     renderCard({ name, score, subScores: null, explainText, f, a, c, g });
+    saveCurrentTab({ name, score, tierCls: tier(score).cls, subScores: null, explainText, f, a, c, g });
   }
 }
 
@@ -1030,13 +1432,14 @@ function recordDecision(decision) {
   const c = +document.getElementById('compliance').value;
   const g = +document.getElementById('geo').value;
 
+  // Use addOrUpdateTab so the merge in that function preserves concernsAddressed etc.
   addOrUpdateTab({
-    name:       name === '—' ? 'Unnamed' : name,
+    name:        name === '—' ? 'Unnamed' : name,
     score, tierCls, f, a, c, g,
-    sourceDocs: [...activeSourceDocs],
-    evidence:   currentEvidence ? { ...currentEvidence } : null,
+    sourceDocs:  [...activeSourceDocs],
+    evidence:    currentEvidence ? { ...currentEvidence } : null,
     decision, notes: note, bannerText, fullTs,
-    subScores:  lastRenderData ? lastRenderData.subScores : null,
+    subScores:   lastRenderData ? lastRenderData.subScores : null,
     explainText: document.getElementById('explainText').textContent,
   });
 }
@@ -1051,24 +1454,121 @@ function resetDecision() {
   updateCard();
 }
 
+// ── Per-concern addressed ─────────────────────────────────────────────────────
+
+function concernKey(text) {
+  return text.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '').slice(0, 60);
+}
+
+function markConcernAddressed(concern, key) {
+  if (currentTabIdx < 0) return;
+  const now = new Date();
+  const ts  = now.toLocaleDateString([], { day: '2-digit', month: 'short', year: 'numeric' }) +
+              ', ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  const tab = supplierTabs[currentTabIdx];
+  const updated = {
+    ...(tab.addressedConcerns || {}),
+    [key]: { ts, text: concern.text, dimension: concern.dimension, severity: concern.severity },
+  };
+  saveCurrentTab({ addressedConcerns: updated });
+
+  // Update this concern's row in-place
+  const row = document.querySelector(`.concern-row[data-key="${CSS.escape(key)}"]`);
+  if (row) {
+    row.classList.add('addressed');
+    const btn = row.querySelector('.mark-one-btn');
+    if (btn) {
+      const check = document.createElement('span');
+      check.className = 'concern-addressed-check';
+      check.textContent = '✓';
+      btn.replaceWith(check);
+    }
+    const body = row.querySelector('.concern-body');
+    if (body && !body.querySelector('.concern-addressed-ts')) {
+      const tsEl = document.createElement('span');
+      tsEl.className   = 'concern-addressed-ts';
+      tsEl.textContent = `Addressed ${ts}`;
+      body.appendChild(tsEl);
+    }
+  }
+
+  // Refresh summary badge
+  refreshConcernsBadge();
+
+  // Individual audit-trail entry with expandable detail
+  appendHistory({
+    name:      tab.name || '—',
+    score:     tab.score || 0,
+    tierLabel: document.getElementById('tierBadge').textContent,
+    tierCls:   tab.tierCls || '',
+    decision:  'Concern addressed',
+    note:      concern.text,
+    fullTs:    ts,
+    detail:    { dimension: concern.dimension, severity: concern.severity, text: concern.text },
+  });
+
+  renderTabs(); // refresh addressed-count badge on the tab
+}
+
+function refreshConcernsBadge() {
+  const badge = document.getElementById('concernsAddressedBadge');
+  if (!badge) return;
+  const tab = currentTabIdx >= 0 ? supplierTabs[currentTabIdx] : null;
+  const addrCount  = Object.keys((tab && tab.addressedConcerns) || {}).length;
+  const totalRows  = document.querySelectorAll('.concern-row').length;
+  if (addrCount > 0) {
+    badge.textContent = `${addrCount} of ${totalRows} concern${totalRows !== 1 ? 's' : ''} marked as addressed`;
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
 // ── Decision history ──────────────────────────────────────────────────────────
 
-function appendHistory({ name, score, tierLabel, tierCls, decision, note, fullTs }) {
+function appendHistory({ name, score, tierLabel, tierCls, decision, note, fullTs, detail }) {
   document.getElementById('historyEmpty').classList.add('hidden');
   const table = document.getElementById('historyTable');
   table.classList.remove('hidden');
 
   const decisionCls = { Approve: 'dec-approve', Escalate: 'dec-escalate', Reject: 'dec-reject' }[decision] || '';
   const tbody = document.getElementById('historyBody');
+
   const tr = document.createElement('tr');
-  tr.innerHTML = `
-    <td class="h-name">${escHtml(name)}</td>
-    <td class="h-score">${score}</td>
-    <td><span class="tier-badge ${tierCls}">${escHtml(tierLabel)}</span></td>
-    <td><span class="history-decision ${decisionCls}">${escHtml(decision)}</span></td>
-    <td class="h-note">${note ? escHtml(note) : '<span class="h-empty">—</span>'}</td>
-    <td class="h-ts">${escHtml(fullTs)}</td>`;
-  tbody.insertBefore(tr, tbody.firstChild);
+  if (detail) tr.classList.add('h-expandable');
+  tr.innerHTML =
+    `<td class="h-name">${escHtml(name)}</td>` +
+    `<td class="h-score">${score}</td>` +
+    `<td><span class="tier-badge ${tierCls}">${escHtml(tierLabel)}</span></td>` +
+    `<td><span class="history-decision ${decisionCls}">${escHtml(decision)}</span></td>` +
+    `<td class="h-note">${note ? escHtml(note) : '<span class="h-empty">—</span>'}</td>` +
+    `<td class="h-ts">${escHtml(fullTs)}${detail ? ' <span class="h-expand-toggle" aria-hidden="true">▶</span>' : ''}</td>`;
+
+  if (detail) {
+    const sevCls = { HIGH: 'sev-high', MEDIUM: 'sev-medium', LOW: 'sev-low' }[detail.severity] || '';
+    const detailTr = document.createElement('tr');
+    detailTr.className = 'h-detail-row hidden';
+    detailTr.innerHTML =
+      `<td colspan="6"><div class="h-detail-content">` +
+      `<span class="concern-dim">${escHtml(detail.dimension)}</span>` +
+      `<span class="sev-badge ${sevCls}">${escHtml(detail.severity)}</span>` +
+      `<p class="h-detail-text">${escHtml(detail.text)}</p>` +
+      `</div></td>`;
+
+    tr.addEventListener('click', () => {
+      const isOpen = !detailTr.classList.contains('hidden');
+      detailTr.classList.toggle('hidden');
+      const arrow = tr.querySelector('.h-expand-toggle');
+      if (arrow) arrow.textContent = isOpen ? '▶' : '▼';
+    });
+
+    // Insert main row first, detail row immediately after
+    tbody.insertBefore(detailTr, tbody.firstChild);
+    tbody.insertBefore(tr, detailTr);
+  } else {
+    tbody.insertBefore(tr, tbody.firstChild);
+  }
 }
 
 function escHtml(str) {
@@ -1180,6 +1680,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   initTooltips();
   initUpload();
+  loadTabsFromStorage();
 
   // Warn when served over HTTPS (e.g. GitHub Pages) — Ollama on http://localhost
   // is blocked as mixed content, so all AI calls will fall back to rule-based.

@@ -107,6 +107,12 @@
           <button class="export-btn no-print" id="btnExport" type="button">⬇ Export PDF</button>
         </div>
 
+        <!-- Loading indicator (shared: document processing + AI scoring) -->
+        <div id="loadingIndicator" class="loading-indicator hidden" role="status" aria-live="polite">
+          <div class="loading-spinner" aria-hidden="true"></div>
+          <span id="loadingText" class="loading-text"></span>
+        </div>
+
         <!-- Source documents -->
         <div id="sourceDocs" class="source-docs hidden">
           <span class="source-docs-label">Source documents</span>
@@ -200,8 +206,11 @@
   <div id="concernsSection" class="concerns-section hidden">
     <div class="section-bar">
       <h2 class="section-heading">Concerns Report</h2>
-      <button id="btnExportLetter" class="export-letter-btn no-print" type="button">⬇ Export Concerns Letter (.docx)</button>
+      <div class="concerns-actions no-print">
+        <button id="btnExportLetter" class="export-letter-btn" type="button">⬇ Export Concerns Letter (.docx)</button>
+      </div>
     </div>
+    <div id="concernsAddressedBadge" class="concerns-addressed-badge hidden"></div>
     <div id="concernsList" class="concerns-list"></div>
   </div>
 
