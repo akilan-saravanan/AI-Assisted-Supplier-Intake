@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Supplier Risk Scoring</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=4" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/docx@7.8.2/build/index.js"></script>
@@ -48,6 +48,27 @@
   </header>
 
   <div class="supplier-tabs-bar no-print" id="supplierTabsBar" style="display:none"></div>
+
+  <!-- ══ INLINE UPLOAD PANEL ═══════════════════════════════════════════════════ -->
+  <div id="inlineUploadPanel" class="inline-upload-panel hidden">
+    <div class="inline-upload-inner">
+      <div class="inline-upload-header">
+        <span class="inline-upload-title">New Supplier</span>
+        <button id="inlineCancelBtn" class="inline-cancel-btn" type="button" aria-label="Cancel">✕</button>
+      </div>
+      <label class="landing-drop-zone inline-drop-zone" for="inlineDocUpload" id="inlineDropZone">
+        <span class="landing-drop-icon">▲</span>
+        <span class="landing-drop-title">Drop documents here or click to upload</span>
+        <span class="landing-drop-sub">PDF or Word (.docx) — multiple files supported</span>
+        <input type="file" id="inlineDocUpload" accept=".pdf,.docx" multiple />
+      </label>
+      <div id="inlineFileChipList" class="file-chip-list hidden"></div>
+      <div class="inline-upload-footer">
+        <button id="inlineBeginBtn" class="begin-btn" disabled type="button">Begin Assessment →</button>
+        <span class="landing-manual-link" id="inlineGoManual">Or enter scores manually →</span>
+      </div>
+    </div>
+  </div>
 
   <div class="layout">
 
@@ -121,9 +142,9 @@
 
         <div class="card-top">
           <div class="ring-wrap">
-            <svg viewBox="0 0 120 120">
-              <circle class="ring-bg" cx="60" cy="60" r="54" />
-              <circle id="scoreRing" cx="60" cy="60" r="54" />
+            <svg viewBox="0 0 120 120" width="120" height="120" overflow="hidden">
+              <circle class="ring-bg" cx="60" cy="60" r="54" fill="none" />
+              <circle id="scoreRing" cx="60" cy="60" r="54" fill="none" />
             </svg>
             <div class="ring-label">
               <span class="score-num" id="compositeScore">—</span>
@@ -237,6 +258,6 @@
 </div><!-- #mainScreen -->
 
 <div id="tooltip" class="dim-tooltip hidden" role="tooltip"></div>
-<script src="scoring.js"></script>
+<script src="scoring.js?v=2"></script>
 </body>
 </html>

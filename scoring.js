@@ -13,7 +13,7 @@ const DIM_META = [
 ];
 
 const OLLAMA_URL   = 'http://localhost:11434/api/generate';
-const OLLAMA_MODEL = 'qwen3:4b';
+const OLLAMA_MODEL = 'mistral';
 
 let currentAbortController = null;
 let debounceTimer = null;
@@ -119,24 +119,16 @@ function confidence(f, a, c, g) {
 
 // ── Ollama API ────────────────────────────────────────────────────────────────
 
-function stripThinkTags(text) {
-  // Qwen3 wraps reasoning in <think>…</think> before the actual response.
-  // /no_think in the prompt suppresses it, but strip defensively too.
-  return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-}
-
 async function askOllama(prompt, signal) {
-  // Prepend /no_think so Qwen3 skips the reasoning preamble.
-  const fullPrompt = `/no_think\n${prompt}`;
   const res = await fetch(OLLAMA_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: OLLAMA_MODEL, prompt: fullPrompt, stream: false, keep_alive: '30m', options: { num_ctx: 8192 } }),
+    body: JSON.stringify({ model: OLLAMA_MODEL, prompt, stream: false, keep_alive: '30m', options: { num_ctx: 8192 } }),
     signal,
   });
   if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
   const data = await res.json();
-  return stripThinkTags(data.response);
+  return data.response;
 }
 
 async function fetchAiScore(f, a, c, g, signal) {
@@ -853,6 +845,14 @@ function clarificationRequest(dimension, issueText) {
   return 'Please provide supporting documentation or a written response addressing this point.';
 }
 
+// ── Decision button state ─────────────────────────────────────────────────────
+
+function setDecisionButtonsDisabled(disabled) {
+  ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => {
+    document.getElementById(id).disabled = disabled;
+  });
+}
+
 // ── Screen transitions ────────────────────────────────────────────────────────
 
 function goToMain() {
@@ -883,6 +883,49 @@ function goToLanding() {
       landing.style.opacity = '1';
     }));
   }, 300);
+}
+
+// ── Inline upload panel ───────────────────────────────────────────────────────
+
+function showInlineUpload() {
+  document.getElementById('inlineUploadPanel').classList.remove('hidden');
+  document.getElementById('mainScreen').querySelector('.layout').style.display = 'none';
+}
+
+function hideInlineUpload() {
+  uploadedFiles = [];
+  updateInlineChips();
+  document.getElementById('inlineUploadPanel').classList.add('hidden');
+  document.getElementById('mainScreen').querySelector('.layout').style.display = '';
+}
+
+function updateInlineChips() {
+  const list     = document.getElementById('inlineFileChipList');
+  const beginBtn = document.getElementById('inlineBeginBtn');
+
+  if (!uploadedFiles.length) {
+    list.classList.add('hidden');
+    list.innerHTML = '';
+    beginBtn.disabled = true;
+    return;
+  }
+
+  list.classList.remove('hidden');
+  list.innerHTML = uploadedFiles.map((f, i) =>
+    `<span class="file-chip">${escHtml(f.name)}` +
+    `<button class="file-chip-remove" data-idx="${i}" type="button" aria-label="Remove">×</button>` +
+    `</span>`
+  ).join('');
+
+  list.querySelectorAll('.file-chip-remove').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.preventDefault();
+      uploadedFiles.splice(+btn.dataset.idx, 1);
+      updateInlineChips();
+    });
+  });
+
+  beginBtn.disabled = false;
 }
 
 // ── Source documents ──────────────────────────────────────────────────────────
@@ -947,12 +990,12 @@ function loadTab(idx) {
   if (tab.decision) {
     banner.textContent = tab.bannerText || '';
     banner.className   = 'decision-banner banner-' + tab.decision.toLowerCase();
-    ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => { document.getElementById(id).disabled = true; });
+    setDecisionButtonsDisabled(true);
     document.getElementById('btnReset').classList.remove('hidden');
   } else {
     banner.textContent = '';
     banner.className   = 'decision-banner hidden';
-    ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => { document.getElementById(id).disabled = false; });
+    setDecisionButtonsDisabled(false);
     document.getElementById('btnReset').classList.add('hidden');
   }
 
@@ -991,6 +1034,13 @@ function addOrUpdateTab(tabData) {
 function saveCurrentTab(data) {
   if (currentTabIdx < 0 || currentTabIdx >= supplierTabs.length) return;
   supplierTabs[currentTabIdx] = { ...supplierTabs[currentTabIdx], ...data };
+  saveTabsToStorage();
+  renderTabs();
+}
+
+function saveTabAt(idx, data) {
+  if (idx < 0 || idx >= supplierTabs.length) return;
+  supplierTabs[idx] = { ...supplierTabs[idx], ...data };
   saveTabsToStorage();
   renderTabs();
 }
@@ -1035,7 +1085,7 @@ function resetMainScreen() {
   banner.className   = 'decision-banner hidden';
   banner.textContent = '';
   document.getElementById('spocNotes').value = '';
-  ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => { document.getElementById(id).disabled = false; });
+  setDecisionButtonsDisabled(false);
   document.getElementById('btnReset').classList.add('hidden');
   document.getElementById('uploadStatus').textContent = '';
 
@@ -1082,14 +1132,64 @@ function updateLandingChips() {
 // ── Begin assessment (multi-doc) ──────────────────────────────────────────────
 
 async function handleBeginAssessment() {
-  const beginBtn  = document.getElementById('beginBtn');
-  const fileNames = uploadedFiles.map(f => f.name);
-  beginBtn.disabled    = true;
-  beginBtn.textContent = 'Extracting…';
+  const beginBtn       = document.getElementById('beginBtn');
+  const inlineBeginBtn = document.getElementById('inlineBeginBtn');
+  const fromInline     = !document.getElementById('inlineUploadPanel').classList.contains('hidden');
 
+  const fileNames   = uploadedFiles.map(f => f.name);
+  const filesForExt = [...uploadedFiles];  // snapshot before clearing
+  uploadedFiles = [];  // clear global list immediately so chips reset
+
+  [beginBtn, inlineBeginBtn].forEach(b => { b.disabled = true; b.textContent = 'Extracting…'; });
+
+  // Transition screens before any async work
+  if (fromInline) {
+    document.getElementById('inlineUploadPanel').classList.add('hidden');
+    document.getElementById('mainScreen').querySelector('.layout').style.display = '';
+  } else {
+    goToMain();
+  }
+  resetMainScreen();  // sets currentTabIdx = -1
+  renderSourceDocs(fileNames);
+
+  // Create the placeholder tab NOW — synchronously before any await — so that
+  // supplierTabs.length increments immediately. This ensures "+ New supplier"
+  // always shows the inline panel (not the landing page) from this point forward,
+  // even if AI extraction later fails.
+  const placeholderName = fileNames.length > 0
+    ? fileNames[0].replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ').trim() || 'New Supplier'
+    : 'New Supplier';
+  // Always push a brand-new tab entry — never merge into an existing one.
+  // We bypass addOrUpdateTab's currentTabIdx conditional entirely so that even
+  // if global state is stale, a new tab is guaranteed.
+  supplierTabs.push({
+    id:                Date.now().toString(),
+    name:              placeholderName,
+    score:             0,
+    tierCls:           '',
+    f: 0, a: 0, c: 0, g: 0,
+    sourceDocs:        [...fileNames],
+    evidence:          null,
+    subScores:         null,
+    explainText:       '',
+    decision:          null,
+    notes:             '',
+    bannerText:        '',
+    fullTs:            '',
+    addressedConcerns: {},
+  });
+  currentTabIdx = supplierTabs.length - 1;
+  saveTabsToStorage();
+  renderTabs();
+  const myTabIdx = currentTabIdx;  // lock in: all saves for this assessment go here
+
+  const statusEl = document.getElementById('uploadStatus');
+  [beginBtn, inlineBeginBtn].forEach(b => { b.disabled = false; b.textContent = 'Begin Assessment →'; });
+
+  // Extract text from uploaded files
   const rawTexts = [];
-  for (let i = 0; i < uploadedFiles.length; i++) {
-    const file = uploadedFiles[i];
+  for (let i = 0; i < filesForExt.length; i++) {
+    const file = filesForExt[i];
     const ext  = file.name.split('.').pop().toLowerCase();
     let text   = '';
     try {
@@ -1099,17 +1199,10 @@ async function handleBeginAssessment() {
     if (text.trim()) rawTexts.push({ text: text.trim(), fileName: file.name });
   }
 
-  goToMain();
-  resetMainScreen();
-  renderSourceDocs(fileNames);
-
-  const statusEl = document.getElementById('uploadStatus');
-  beginBtn.disabled    = false;
-  beginBtn.textContent = 'Begin Assessment →';
-
   if (!rawTexts.length) {
     errorLoader('Could not read any documents — please check the file format and try again.');
     statusEl.textContent = 'Could not read any documents — enter scores manually.';
+    // Placeholder tab stays; user can enter scores manually on it
     return;
   }
 
@@ -1141,6 +1234,7 @@ async function handleBeginAssessment() {
       } catch {
         errorLoader('AI unavailable — Ollama may not be running. Enter scores manually.');
         statusEl.textContent = 'AI unavailable — enter scores manually.';
+        // Placeholder tab stays; user can enter scores manually on it
         return;
       }
     }
@@ -1152,13 +1246,15 @@ async function handleBeginAssessment() {
   const c = Number.isFinite(+parsed.compliance)  ? clamp(parsed.compliance) : 50;
   const g = Number.isFinite(+parsed.geo)         ? clamp(parsed.geo)        : 50;
 
-  if (parsed.name && typeof parsed.name === 'string') {
-    document.getElementById('supplierName').value = parsed.name.trim();
-  }
-  document.getElementById('financial').value  = f;
-  document.getElementById('audit').value      = a;
-  document.getElementById('compliance').value = c;
-  document.getElementById('geo').value        = g;
+  const extractedName = (typeof parsed.name === 'string' && parsed.name.trim())
+    ? parsed.name.trim()
+    : placeholderName;
+
+  document.getElementById('supplierName').value = extractedName;
+  document.getElementById('financial').value    = f;
+  document.getElementById('audit').value        = a;
+  document.getElementById('compliance').value   = c;
+  document.getElementById('geo').value          = g;
   DIM_META.forEach((dim, i) => {
     document.getElementById(dim.val1).textContent = [f, a, c, g][i];
   });
@@ -1181,28 +1277,24 @@ async function handleBeginAssessment() {
 
   hideLoader();
 
-  // Create the tab entry now so it exists before AI scoring updates it.
-  // resetMainScreen() already set currentTabIdx = -1, ensuring addOrUpdateTab pushes
-  // a new entry rather than overwriting an existing supplier's tab.
+  // Update the placeholder tab with real extracted data.
+  // Use saveTabAt(myTabIdx) instead of addOrUpdateTab so we always write to the
+  // correct tab regardless of what currentTabIdx is now (user may have clicked
+  // another tab during the long AI extraction).
   const initialScore = compositeRuleBased(f, a, c, g);
-  currentTabIdx = -1; // explicit guard: never overwrite an existing tab on new assessment
-  addOrUpdateTab({
-    name:             (parsed.name || '').trim() || 'Unnamed Supplier',
-    score:            initialScore,
-    tierCls:          tier(initialScore).cls,
+  saveTabAt(myTabIdx, {
+    name:        extractedName,
+    score:       initialScore,
+    tierCls:     tier(initialScore).cls,
     f, a, c, g,
-    sourceDocs:       [...fileNames],
-    evidence:         currentEvidence ? { ...currentEvidence } : null,
-    subScores:        null,
-    explainText:      '',
-    decision:         null,
-    notes:            '',
-    bannerText:       '',
-    fullTs:           '',
-    addressedConcerns: {},
+    sourceDocs:  [...fileNames],
+    evidence:    currentEvidence ? { ...currentEvidence } : null,
   });
 
-  uploadedFiles = [];
+  // Ensure the newly assessed tab is the active one so updateCard saves correctly
+  currentTabIdx = myTabIdx;
+  renderTabs();
+
   updateCard();
 }
 
@@ -1313,7 +1405,8 @@ function updateCard() {
 async function runUpdate() {
   if (currentAbortController) currentAbortController.abort();
   currentAbortController = new AbortController();
-  const signal = currentAbortController.signal;
+  const signal    = currentAbortController.signal;
+  const myTabIdx  = currentTabIdx;  // lock in which tab this scoring run belongs to
 
   const name = document.getElementById('supplierName').value.trim() || 'Unnamed Supplier';
   const f = +document.getElementById('financial').value;
@@ -1370,10 +1463,14 @@ async function runUpdate() {
     const explainText = await fetchAiExplain(f, a, c, g, scoreData.score, t.label, signal);
     if (signal.aborted) return;
 
+    if (signal.aborted) return;
     hideLoader();
     setAiNotice(false);
-    renderCard({ name, score: scoreData.score, subScores: scoreData, explainText: explainText.trim(), f, a, c, g });
-    saveCurrentTab({
+    // Only render and save if the user hasn't navigated away from this tab
+    if (currentTabIdx === myTabIdx) {
+      renderCard({ name, score: scoreData.score, subScores: scoreData, explainText: explainText.trim(), f, a, c, g });
+    }
+    saveTabAt(myTabIdx, {
       name, score: scoreData.score,
       tierCls:    tier(scoreData.score).cls,
       subScores:  scoreData,
@@ -1384,12 +1481,14 @@ async function runUpdate() {
   } catch (err) {
     if (signal.aborted) return;
     console.warn('[AI] Falling back to rule-based:', err.message);
-    errorLoader('AI unavailable — showing rule-based score');
     const score       = compositeRuleBased(f, a, c, g);
     const explainText = explainRuleBased(score, f, a, c, g);
-    setAiNotice(true);
-    renderCard({ name, score, subScores: null, explainText, f, a, c, g });
-    saveCurrentTab({ name, score, tierCls: tier(score).cls, subScores: null, explainText, f, a, c, g });
+    if (currentTabIdx === myTabIdx) {
+      errorLoader('AI unavailable — showing rule-based score');
+      setAiNotice(true);
+      renderCard({ name, score, subScores: null, explainText, f, a, c, g });
+    }
+    saveTabAt(myTabIdx, { name, score, tierCls: tier(score).cls, subScores: null, explainText, f, a, c, g });
   }
 }
 
@@ -1422,7 +1521,7 @@ function recordDecision(decision) {
   banner.textContent = bannerText;
   banner.className   = 'decision-banner banner-' + decision.toLowerCase();
 
-  ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => { document.getElementById(id).disabled = true; });
+  setDecisionButtonsDisabled(true);
   document.getElementById('btnReset').classList.remove('hidden');
 
   appendHistory({ name, score, tierLabel, tierCls, decision, note, fullTs });
@@ -1449,7 +1548,7 @@ function resetDecision() {
   banner.className   = 'decision-banner hidden';
   banner.textContent = '';
   document.getElementById('spocNotes').value = '';
-  ['btnApprove', 'btnEscalate', 'btnReject'].forEach(id => { document.getElementById(id).disabled = false; });
+  setDecisionButtonsDisabled(false);
   document.getElementById('btnReset').classList.add('hidden');
   updateCard();
 }
@@ -1551,6 +1650,7 @@ function appendHistory({ name, score, tierLabel, tierCls, decision, note, fullTs
     detailTr.className = 'h-detail-row hidden';
     detailTr.innerHTML =
       `<td colspan="6"><div class="h-detail-content">` +
+      `<span class="h-detail-heading">Concerns Addressed</span>` +
       `<span class="concern-dim">${escHtml(detail.dimension)}</span>` +
       `<span class="sev-badge ${sevCls}">${escHtml(detail.severity)}</span>` +
       `<p class="h-detail-text">${escHtml(detail.text)}</p>` +
@@ -1662,10 +1762,49 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btnReset').addEventListener('click', resetDecision);
   document.getElementById('btnExport').addEventListener('click', () => window.print());
 
+  // + New supplier button
   document.getElementById('btnNewSupplier').addEventListener('click', () => {
     uploadedFiles = [];
     updateLandingChips();
-    goToLanding();
+    if (supplierTabs.length > 0) {
+      showInlineUpload();
+    } else {
+      goToLanding();
+    }
+  });
+
+  // Inline upload panel wiring
+  const inlineInput  = document.getElementById('inlineDocUpload');
+  const inlineZone   = document.getElementById('inlineDropZone');
+
+  inlineInput.addEventListener('change', () => {
+    Array.from(inlineInput.files).forEach(f => {
+      const ext = f.name.split('.').pop().toLowerCase();
+      if (ext === 'pdf' || ext === 'docx') uploadedFiles.push(f);
+    });
+    inlineInput.value = '';
+    updateInlineChips();
+  });
+
+  inlineZone.addEventListener('dragover',  e => { e.preventDefault(); inlineZone.classList.add('drag-over'); });
+  inlineZone.addEventListener('dragleave', () => inlineZone.classList.remove('drag-over'));
+  inlineZone.addEventListener('drop', e => {
+    e.preventDefault();
+    inlineZone.classList.remove('drag-over');
+    Array.from(e.dataTransfer.files).forEach(f => {
+      const ext = f.name.split('.').pop().toLowerCase();
+      if (ext === 'pdf' || ext === 'docx') uploadedFiles.push(f);
+    });
+    updateInlineChips();
+  });
+
+  document.getElementById('inlineBeginBtn').addEventListener('click', handleBeginAssessment);
+
+  document.getElementById('inlineCancelBtn').addEventListener('click', hideInlineUpload);
+
+  document.getElementById('inlineGoManual').addEventListener('click', () => {
+    hideInlineUpload();
+    resetMainScreen();
   });
 
   document.getElementById('btnExportLetter').addEventListener('click', () => {
