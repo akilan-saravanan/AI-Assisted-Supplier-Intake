@@ -26,6 +26,10 @@ let currentTabIdx    = -1;
 let lastRenderData   = null;
 let currentEvidence  = null;  // evidence extracted from documents
 
+// List page sort state
+let sortKey = 'date';   // 'date' | 'status' | 'concerns' | 'addressed'
+let sortDir = 'desc';   // 'asc' | 'desc'
+
 // ── localStorage persistence ──────────────────────────────────────────────────
 
 const LS_TABS   = 'srisk_tabs';
@@ -44,17 +48,21 @@ function loadTabsFromStorage() {
     if (!stored) return;
     const tabs = JSON.parse(stored);
     if (!Array.isArray(tabs) || !tabs.length) return;
-    supplierTabs = tabs;
-    const saved = parseInt(localStorage.getItem(LS_ACTIVE), 10);
-    const idx   = Number.isFinite(saved) && saved >= 0 && saved < tabs.length ? saved : tabs.length - 1;
-    // Show main screen directly — no fade needed on page load
-    document.getElementById('landingPage').style.display = 'none';
-    const main = document.getElementById('mainScreen');
-    main.style.display = 'flex';
-    main.style.opacity = '1';
-    currentTabIdx = idx;
-    renderTabs();
-    loadTab(idx);
+    // Backfill fields added in later versions (spread tab first, then fill missing)
+    const now = Date.now();
+    supplierTabs = tabs.map((tab, i) => {
+      let concernsCount = tab.concernsCount != null ? tab.concernsCount : 0;
+      if (tab.concernsCount == null && tab.evidence) {
+        try { concernsCount = buildConcernsReportForTab(tab).length; } catch {}
+      }
+      return {
+        addressedConcerns: {},
+        ...tab,
+        dateAdded:     tab.dateAdded != null ? tab.dateAdded : (now - (tabs.length - i) * 60000),
+        concernsCount,
+      };
+    });
+    renderSupplierList();
   } catch (e) {
     console.warn('[Storage] Failed to restore tabs:', e.message);
   }
@@ -65,8 +73,7 @@ function clearAllTabs() {
   supplierTabs  = [];
   currentTabIdx = -1;
   try { localStorage.removeItem(LS_TABS); localStorage.removeItem(LS_ACTIVE); } catch {}
-  renderTabs();
-  goToLanding();
+  renderSupplierList();
 }
 
 // ── Fallback (rule-based) helpers ─────────────────────────────────────────────
@@ -605,6 +612,16 @@ function renderConcernsReport(concerns) {
     row.className    = `concern-row${done ? ' addressed' : ''}`;
     row.dataset.key  = key;
 
+    // Checkbox for bulk-select (only on unaddressed)
+    if (!done) {
+      const cb = document.createElement('input');
+      cb.type      = 'checkbox';
+      cb.className = 'concern-check';
+      cb.dataset.key = key;
+      cb.addEventListener('change', updateMarkSelectedBtn);
+      row.appendChild(cb);
+    }
+
     const badge = document.createElement('span');
     badge.className   = `sev-badge ${sm.cls}`;
     badge.textContent = sm.label;
@@ -616,22 +633,18 @@ function renderConcernsReport(concerns) {
       `<span class="concern-text">${escHtml(c.text)}</span>` +
       (done ? `<span class="concern-addressed-ts">Addressed ${escHtml(addressed[key].ts)}</span>` : '');
 
-    let action;
     if (done) {
-      action = document.createElement('span');
-      action.className   = 'concern-addressed-check';
-      action.textContent = '✓';
+      const check = document.createElement('span');
+      check.className   = 'concern-addressed-check';
+      check.textContent = '✓';
+      row.append(badge, body, check);
     } else {
-      action = document.createElement('button');
-      action.className   = 'mark-one-btn';
-      action.type        = 'button';
-      action.textContent = 'Mark addressed';
-      action.addEventListener('click', () => markConcernAddressed(c, key));
+      row.append(badge, body);
     }
-
-    row.append(badge, body, action);
     list.appendChild(row);
   });
+
+  updateMarkSelectedBtn();
 
   refreshConcernsBadge();
 }
@@ -855,78 +868,312 @@ function setDecisionButtonsDisabled(disabled) {
 
 // ── Screen transitions ────────────────────────────────────────────────────────
 
-function goToMain() {
-  const landing = document.getElementById('landingPage');
-  const main    = document.getElementById('mainScreen');
-  landing.style.opacity = '0';
-  setTimeout(() => {
-    landing.style.display = 'none';
-    landing.style.opacity = '';
-    main.style.display    = 'flex';
-    main.style.opacity    = '0';
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      main.style.opacity = '1';
-    }));
-  }, 300);
+// ── Page navigation ───────────────────────────────────────────────────────────
+
+function goToList() {
+  document.getElementById('mainScreen').style.display = 'none';
+  document.getElementById('listPage').style.display   = '';
+  currentTabIdx = -1;
+  renderSupplierList();
 }
 
-function goToLanding() {
-  const landing = document.getElementById('landingPage');
-  const main    = document.getElementById('mainScreen');
-  main.style.opacity = '0';
-  setTimeout(() => {
-    main.style.display    = 'none';
-    main.style.opacity    = '';
-    landing.style.display = '';
-    landing.style.opacity = '0';
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      landing.style.opacity = '1';
-    }));
-  }, 300);
+function goToDetail(idx) {
+  document.getElementById('listPage').style.display   = 'none';
+  document.getElementById('mainScreen').style.display = 'flex';
+  if (idx >= 0 && idx < supplierTabs.length) {
+    loadTab(idx);
+  }
 }
 
-// ── Inline upload panel ───────────────────────────────────────────────────────
+// ── Addressed-pill color ──────────────────────────────────────────────────────
 
-function showInlineUpload() {
-  document.getElementById('inlineUploadPanel').classList.remove('hidden');
-  document.getElementById('mainScreen').querySelector('.layout').style.display = 'none';
+function addressedPillStyle(addressed, total) {
+  if (total <= 0 || addressed <= 0) return '';
+  const ratio = Math.min(1, addressed / total);
+  // Interpolate hue 0 (red) → 120 (green) through orange/yellow
+  const hue = Math.round(ratio * 120);
+  return `background:hsl(${hue},75%,93%);color:hsl(${hue},62%,28%);border-color:hsl(${hue},60%,82%);`;
 }
 
-function hideInlineUpload() {
+// ── Supplier list actions ─────────────────────────────────────────────────────
+
+function deleteSupplier(idx) {
+  const tab = supplierTabs[idx];
+  if (!tab) return;
+  if (!confirm(`Delete "${tab.name || 'this supplier'}"? This cannot be undone.`)) return;
+  supplierTabs.splice(idx, 1);
+  saveTabsToStorage();
+  renderSupplierList();
+}
+
+function exportSupplierSummaryFromList(idx) {
+  const tab = supplierTabs[idx];
+  if (!tab) return;
+  const t       = tier(tab.score || 0);
+  const clrMap  = { 'tier-green': '#16a34a', 'tier-amber': '#d97706', 'tier-red': '#dc2626' };
+  const clr     = clrMap[t.cls] || '#64748b';
+  const dateStr = tab.dateAdded
+    ? new Date(tab.dateAdded).toLocaleDateString([], { day: '2-digit', month: 'long', year: 'numeric' })
+    : '—';
+  const decisionBadge = { Approve: '#16a34a', Escalate: '#d97706', Reject: '#dc2626' }[tab.decision] || '#64748b';
+
+  const win = window.open('', '_blank', 'width=820,height=700');
+  win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <title>Supplier Summary – ${escHtml(tab.name || 'Unnamed')}</title>
+    <style>
+      body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:48px;color:#1e293b;max-width:700px;margin:0 auto;}
+      h1{font-size:22px;font-weight:700;margin-bottom:4px;}
+      .meta{color:#64748b;font-size:13px;margin-bottom:32px;}
+      .score-block{display:flex;align-items:baseline;gap:8px;margin-bottom:24px;}
+      .score-num{font-size:56px;font-weight:800;color:${clr};}
+      .score-label{font-size:18px;color:#64748b;}
+      .tier{display:inline-block;padding:4px 14px;border-radius:20px;font-size:13px;font-weight:600;background:${clr}22;color:${clr};margin-bottom:24px;}
+      table{width:100%;border-collapse:collapse;margin-bottom:24px;}
+      th{text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;color:#64748b;padding:8px 12px;border-bottom:2px solid #e2e8f0;}
+      td{padding:10px 12px;border-bottom:1px solid #f1f5f9;font-size:14px;}
+      .bar{height:6px;border-radius:3px;background:#e2e8f0;margin-top:4px;}
+      .bar-fill{height:6px;border-radius:3px;}
+      .decision{display:inline-block;padding:3px 12px;border-radius:12px;font-size:13px;font-weight:600;background:${decisionBadge}22;color:${decisionBadge};}
+      .explain{font-size:13px;color:#475569;line-height:1.6;border-left:3px solid #e2e8f0;padding-left:12px;margin-top:16px;}
+      .footer{margin-top:40px;font-size:11px;color:#94a3b8;}
+      @media print{body{padding:24px;}}
+    </style></head><body>
+    <h1>${escHtml(tab.name || 'Unnamed Supplier')}</h1>
+    <div class="meta">Assessed ${dateStr} &nbsp;·&nbsp; Source: ${(tab.sourceDocs || []).map(escHtml).join(', ') || 'Manual entry'}</div>
+    <div class="score-block"><span class="score-num">${tab.score || 0}</span><span class="score-label">/ 100</span></div>
+    <div class="tier">${escHtml(t.label)}</div>
+    <table>
+      <tr><th>Dimension</th><th>Score</th><th style="width:40%">Weight</th></tr>
+      ${[['Financial Health','f','35%'],['Audit History','a','25%'],['Compliance Status','c','25%'],['Geo & ESG Risk','g','15%']].map(([lbl,k,wt]) => {
+        const v = tab[k] || 0;
+        const bc = v >= 70 ? '#16a34a' : v >= 40 ? '#d97706' : '#dc2626';
+        return `<tr><td>${lbl}</td><td><strong>${v}</strong></td><td><div class="bar"><div class="bar-fill" style="width:${v}%;background:${bc};"></div></div><small style="color:#94a3b8;">${wt} weight</small></td></tr>`;
+      }).join('')}
+    </table>
+    ${tab.decision ? `<p>Decision: <span class="decision">${escHtml(tab.decision)}</span></p>` : ''}
+    ${tab.notes ? `<p style="font-size:13px;color:#475569;margin-top:8px;"><strong>Notes:</strong> ${escHtml(tab.notes)}</p>` : ''}
+    ${tab.explainText ? `<div class="explain">${escHtml(tab.explainText)}</div>` : ''}
+    <div class="footer">Supplier Risk Scoring — generated ${new Date().toLocaleString()}</div>
+    </body></html>`);
+  win.document.close();
+  setTimeout(() => win.print(), 400);
+}
+
+function exportConcernsLetterForTab(idx) {
+  const tab = supplierTabs[idx];
+  if (!tab || !tab.evidence) {
+    alert('No document evidence available for this supplier. Run a document assessment first.');
+    return;
+  }
+  const concerns = buildConcernsReportForTab(tab);
+  if (!concerns.length) {
+    alert('No concerns found for this supplier.');
+    return;
+  }
+  exportConcernsLetter(tab.name || 'Supplier', concerns);
+}
+
+// ── Supplier list rendering ───────────────────────────────────────────────────
+
+function renderSupplierList() {
+  const wrap       = document.getElementById('supplierListWrap');
+  const emptyState = document.getElementById('listEmptyState');
+  const toolbar    = document.getElementById('listToolbar');
+  const countEl    = document.getElementById('listCount');
+  if (!wrap) return;
+
+  if (!supplierTabs.length) {
+    wrap.innerHTML = '';
+    emptyState.classList.remove('hidden');  // show empty state
+    toolbar.style.visibility = 'hidden';
+    return;
+  }
+
+  emptyState.classList.add('hidden');
+  toolbar.style.visibility = '';
+  countEl.textContent = `${supplierTabs.length} supplier${supplierTabs.length !== 1 ? 's' : ''}`;
+
+  // Sort
+  const statusOrder = { Approve: 0, Escalate: 1, null: 2, undefined: 2, Reject: 3 };
+  const sorted = supplierTabs
+    .map((tab, i) => ({ ...tab, _origIdx: i }))
+    .sort((a, b) => {
+      let cmp = 0;
+      if (sortKey === 'date') {
+        cmp = (b.dateAdded || 0) - (a.dateAdded || 0);
+      } else if (sortKey === 'name') {
+        cmp = (a.name || '').localeCompare(b.name || '', undefined, { sensitivity: 'base' });
+      } else if (sortKey === 'status') {
+        cmp = (statusOrder[a.decision] ?? 2) - (statusOrder[b.decision] ?? 2);
+      } else if (sortKey === 'concerns') {
+        cmp = (b.concernsCount || 0) - (a.concernsCount || 0);
+      } else if (sortKey === 'addressed') {
+        cmp = Object.keys(b.addressedConcerns || {}).length
+            - Object.keys(a.addressedConcerns || {}).length;
+      }
+      return sortDir === 'asc' ? -cmp : cmp;
+    });
+
+  wrap.innerHTML = sorted.map(tab => {
+    const decision    = tab.decision || 'Pending';
+    const decisionCls = { Approve: 'status-approved', Escalate: 'status-escalated',
+                          Reject: 'status-rejected', Pending: 'status-pending' }[decision] || 'status-pending';
+    const concerns  = tab.concernsCount || 0;
+    const addressed = Object.keys(tab.addressedConcerns || {}).length;
+    const addrStyle = addressedPillStyle(addressed, concerns);
+    const dotCls    = { 'tier-green': 'dot-green', 'tier-amber': 'dot-amber',
+                        'tier-red': 'dot-red' }[tab.tierCls] || 'dot-grey';
+    const dateStr   = tab.dateAdded
+      ? new Date(tab.dateAdded).toLocaleDateString([], { day: '2-digit', month: 'short', year: 'numeric' })
+      : '—';
+    const hasConcerns = tab.evidence && (tab.concernsCount || 0) > 0;
+    return `
+      <div class="supplier-row" data-idx="${tab._origIdx}" role="button" tabindex="0">
+        <div class="supplier-row-left">
+          <span class="sup-tab-dot ${dotCls}"></span>
+          <div class="supplier-row-info">
+            <span class="supplier-row-name">${escHtml(tab.name || 'Unnamed')}</span>
+            <span class="supplier-row-meta">Score ${tab.score || 0} &nbsp;·&nbsp; Added ${dateStr}</span>
+          </div>
+        </div>
+        <div class="supplier-row-right">
+          ${concerns  > 0 ? `<span class="concern-pill">${concerns} concern${concerns !== 1 ? 's' : ''}</span>` : ''}
+          ${addressed > 0 ? `<span class="addressed-pill"${addrStyle ? ` style="${addrStyle}"` : ''}>${addressed} of ${concerns} addressed</span>` : ''}
+          <span class="status-pill ${decisionCls}">${escHtml(decision)}</span>
+          <span class="row-chevron">›</span>
+          <div class="row-actions" role="presentation">
+            <div class="row-export-wrap">
+              <button class="row-export-btn" data-idx="${tab._origIdx}" type="button" title="Export options">⬇</button>
+              <div class="row-export-menu hidden">
+                <button class="row-export-item" data-action="pdf" data-idx="${tab._origIdx}" type="button">Summary PDF</button>
+                <button class="row-export-item${hasConcerns ? '' : ' disabled'}" data-action="letter" data-idx="${tab._origIdx}" type="button">Concerns Letter (.docx)</button>
+              </div>
+            </div>
+            <button class="row-delete-btn" data-idx="${tab._origIdx}" type="button" title="Delete supplier">✕</button>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  wrap.querySelectorAll('.supplier-row').forEach(row => {
+    const open = () => goToDetail(+row.dataset.idx);
+    row.addEventListener('click', open);
+    row.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
+  });
+
+  // Delete buttons
+  wrap.querySelectorAll('.row-delete-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      deleteSupplier(+btn.dataset.idx);
+    });
+  });
+
+  // Export toggle + items
+  wrap.querySelectorAll('.row-export-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const menu = btn.nextElementSibling;
+      const isOpen = !menu.classList.contains('hidden');
+      // Close all other menus first
+      wrap.querySelectorAll('.row-export-menu').forEach(m => m.classList.add('hidden'));
+      if (!isOpen) menu.classList.remove('hidden');
+    });
+  });
+
+  wrap.querySelectorAll('.row-export-item').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      if (btn.classList.contains('disabled')) return;
+      const idx = +btn.dataset.idx;
+      if (btn.dataset.action === 'pdf') exportSupplierSummaryFromList(idx);
+      else exportConcernsLetterForTab(idx);
+      btn.closest('.row-export-menu').classList.add('hidden');
+    });
+  });
+
+  // Close export menus when clicking elsewhere
+  document.addEventListener('click', closeAllExportMenus, { once: true });
+  function closeAllExportMenus() {
+    wrap.querySelectorAll('.row-export-menu').forEach(m => m.classList.add('hidden'));
+  }
+
+  // Sync sort button states
+  document.querySelectorAll('.sort-btn').forEach(btn => {
+    const isActive = btn.dataset.sort === sortKey;
+    btn.classList.toggle('active', isActive);
+    btn.classList.toggle('desc', isActive && sortDir === 'desc');
+    btn.classList.toggle('asc',  isActive && sortDir === 'asc');
+  });
+}
+
+// ── Upload modal ──────────────────────────────────────────────────────────────
+
+function showUploadModal() {
   uploadedFiles = [];
-  updateInlineChips();
-  document.getElementById('inlineUploadPanel').classList.add('hidden');
-  document.getElementById('mainScreen').querySelector('.layout').style.display = '';
+  updateModalChips();
+  document.getElementById('uploadModal').classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
 }
 
-function updateInlineChips() {
-  const list     = document.getElementById('inlineFileChipList');
-  const beginBtn = document.getElementById('inlineBeginBtn');
+function hideUploadModal() {
+  uploadedFiles = [];
+  updateModalChips();
+  document.getElementById('uploadModal').classList.add('hidden');
+  document.body.style.overflow = '';
+}
 
+function updateModalChips() {
+  const list     = document.getElementById('modalFileChipList');
+  const beginBtn = document.getElementById('modalBeginBtn');
   if (!uploadedFiles.length) {
     list.classList.add('hidden');
     list.innerHTML = '';
     beginBtn.disabled = true;
     return;
   }
-
   list.classList.remove('hidden');
   list.innerHTML = uploadedFiles.map((f, i) =>
-    `<span class="file-chip">${escHtml(f.name)}` +
+    `<span class="file-chip">` +
+    `<span class="file-chip-name" title="${escHtml(f.name)}">${escHtml(f.name)}</span>` +
     `<button class="file-chip-remove" data-idx="${i}" type="button" aria-label="Remove">×</button>` +
     `</span>`
   ).join('');
-
   list.querySelectorAll('.file-chip-remove').forEach(btn => {
     btn.addEventListener('click', e => {
       e.preventDefault();
       uploadedFiles.splice(+btn.dataset.idx, 1);
-      updateInlineChips();
+      updateModalChips();
     });
   });
-
   beginBtn.disabled = false;
 }
+
+// ── Concerns count (without DOM) ──────────────────────────────────────────────
+
+function buildConcernsReportForTab(tab) {
+  if (!tab || !tab.evidence) return [];
+  const severityOrder = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+  const scores = { financial: tab.f || 0, audit: tab.a || 0, compliance: tab.c || 0, geo: tab.g || 0 };
+  const concerns = [];
+  DIM_META.forEach(dim => {
+    const items = tab.evidence[dim.id + '_concerns'] || [];
+    const score = scores[dim.id];
+    items.forEach(text => {
+      if (text && text.trim()) {
+        concerns.push({ dimension: dim.label, text: text.trim(),
+          severity: getSeverity(score), dimScore: score });
+      }
+    });
+  });
+  const seen = new Set();
+  return concerns
+    .filter(c => { const k = c.text.toLowerCase().replace(/\s+/g, ' '); if (seen.has(k)) return false; seen.add(k); return true; })
+    .sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity] || a.dimension.localeCompare(b.dimension));
+}
+
+// ── Inline upload panel ───────────────────────────────────────────────────────
+
 
 // ── Source documents ──────────────────────────────────────────────────────────
 
@@ -948,23 +1195,8 @@ function renderSourceDocs(fileNames) {
 // ── Supplier tabs ─────────────────────────────────────────────────────────────
 
 function renderTabs() {
-  const bar = document.getElementById('supplierTabsBar');
-  if (!supplierTabs.length) { bar.style.display = 'none'; return; }
-  bar.style.display = '';
-  bar.innerHTML = supplierTabs.map((tab, i) => {
-    const dotCls    = { 'tier-green': 'dot-green', 'tier-amber': 'dot-amber', 'tier-red': 'dot-red' }[tab.tierCls] || 'dot-grey';
-    const active    = i === currentTabIdx ? ' active' : '';
-    const addrCount = Object.keys(tab.addressedConcerns || {}).length;
-    const addrBadge = addrCount > 0
-      ? `<span class="tab-addressed-badge" title="${addrCount} concern${addrCount > 1 ? 's' : ''} addressed">${addrCount}</span>` : '';
-    return `<button class="sup-tab${active}" data-idx="${i}">` +
-      `<span class="sup-tab-dot ${dotCls}"></span>${escHtml(tab.name)}${addrBadge}</button>`;
-  }).join('') +
-  `<button class="clear-tabs-btn no-print" id="btnClearAllTabs" type="button">Clear all</button>`;
-  bar.querySelectorAll('.sup-tab').forEach(btn => {
-    btn.addEventListener('click', () => loadTab(+btn.dataset.idx));
-  });
-  document.getElementById('btnClearAllTabs').addEventListener('click', clearAllTabs);
+  // Tab bar removed — list page is now the navigation surface.
+  // Keep as a no-op so existing callers don't throw.
 }
 
 function loadTab(idx) {
@@ -1020,29 +1252,31 @@ function loadTab(idx) {
 
 function addOrUpdateTab(tabData) {
   if (currentTabIdx === -1) {
-    if (!tabData.id) tabData.id = Date.now().toString();
-    supplierTabs.push(tabData);
+    const newTab = {
+      id:                Date.now().toString(),
+      dateAdded:         Date.now(),
+      addressedConcerns: {},
+      concernsCount:     0,
+      ...tabData,
+    };
+    supplierTabs.push(newTab);
     currentTabIdx = supplierTabs.length - 1;
   } else {
-    // Merge so fields not in tabData (e.g. concernsAddressed) are preserved
     supplierTabs[currentTabIdx] = { ...supplierTabs[currentTabIdx], ...tabData };
   }
   saveTabsToStorage();
-  renderTabs();
 }
 
 function saveCurrentTab(data) {
   if (currentTabIdx < 0 || currentTabIdx >= supplierTabs.length) return;
   supplierTabs[currentTabIdx] = { ...supplierTabs[currentTabIdx], ...data };
   saveTabsToStorage();
-  renderTabs();
 }
 
 function saveTabAt(idx, data) {
   if (idx < 0 || idx >= supplierTabs.length) return;
   supplierTabs[idx] = { ...supplierTabs[idx], ...data };
   saveTabsToStorage();
-  renderTabs();
 }
 
 // ── Reset main screen ─────────────────────────────────────────────────────────
@@ -1097,71 +1331,28 @@ function resetMainScreen() {
   lastRenderData = null;
 }
 
-// ── Landing page file chips ───────────────────────────────────────────────────
-
-function updateLandingChips() {
-  const list     = document.getElementById('fileChipList');
-  const beginBtn = document.getElementById('beginBtn');
-
-  if (!uploadedFiles.length) {
-    list.classList.add('hidden');
-    list.innerHTML = '';
-    beginBtn.disabled = true;
-    return;
-  }
-
-  list.classList.remove('hidden');
-  list.innerHTML = uploadedFiles.map((f, i) =>
-    `<span class="file-chip">` +
-    `<span class="file-chip-name" title="${escHtml(f.name)}">${escHtml(f.name)}</span>` +
-    `<button class="file-chip-remove" data-idx="${i}" type="button" aria-label="Remove">×</button>` +
-    `</span>`
-  ).join('');
-
-  list.querySelectorAll('.file-chip-remove').forEach(btn => {
-    btn.addEventListener('click', e => {
-      e.preventDefault();
-      uploadedFiles.splice(+btn.dataset.idx, 1);
-      updateLandingChips();
-    });
-  });
-
-  beginBtn.disabled = false;
-}
-
 // ── Begin assessment (multi-doc) ──────────────────────────────────────────────
 
 async function handleBeginAssessment() {
-  const beginBtn       = document.getElementById('beginBtn');
-  const inlineBeginBtn = document.getElementById('inlineBeginBtn');
-  const fromInline     = !document.getElementById('inlineUploadPanel').classList.contains('hidden');
+  const modalBeginBtn = document.getElementById('modalBeginBtn');
 
   const fileNames   = uploadedFiles.map(f => f.name);
-  const filesForExt = [...uploadedFiles];  // snapshot before clearing
-  uploadedFiles = [];  // clear global list immediately so chips reset
+  const filesForExt = [...uploadedFiles];
+  uploadedFiles = [];
 
-  [beginBtn, inlineBeginBtn].forEach(b => { b.disabled = true; b.textContent = 'Extracting…'; });
+  if (modalBeginBtn) { modalBeginBtn.disabled = true; modalBeginBtn.textContent = 'Extracting…'; }
 
-  // Transition screens before any async work
-  if (fromInline) {
-    document.getElementById('inlineUploadPanel').classList.add('hidden');
-    document.getElementById('mainScreen').querySelector('.layout').style.display = '';
-  } else {
-    goToMain();
-  }
+  // Close modal and navigate to detail view before any async work
+  hideUploadModal();
+  document.getElementById('listPage').style.display   = 'none';
+  document.getElementById('mainScreen').style.display = 'flex';
   resetMainScreen();  // sets currentTabIdx = -1
   renderSourceDocs(fileNames);
 
-  // Create the placeholder tab NOW — synchronously before any await — so that
-  // supplierTabs.length increments immediately. This ensures "+ New supplier"
-  // always shows the inline panel (not the landing page) from this point forward,
-  // even if AI extraction later fails.
+  // Push a new tab synchronously so it's in the list immediately
   const placeholderName = fileNames.length > 0
     ? fileNames[0].replace(/\.[^.]+$/, '').replace(/[-_]+/g, ' ').trim() || 'New Supplier'
     : 'New Supplier';
-  // Always push a brand-new tab entry — never merge into an existing one.
-  // We bypass addOrUpdateTab's currentTabIdx conditional entirely so that even
-  // if global state is stale, a new tab is guaranteed.
   supplierTabs.push({
     id:                Date.now().toString(),
     name:              placeholderName,
@@ -1177,14 +1368,15 @@ async function handleBeginAssessment() {
     bannerText:        '',
     fullTs:            '',
     addressedConcerns: {},
+    dateAdded:         Date.now(),
+    concernsCount:     0,
   });
   currentTabIdx = supplierTabs.length - 1;
   saveTabsToStorage();
-  renderTabs();
-  const myTabIdx = currentTabIdx;  // lock in: all saves for this assessment go here
+  const myTabIdx = currentTabIdx;
 
   const statusEl = document.getElementById('uploadStatus');
-  [beginBtn, inlineBeginBtn].forEach(b => { b.disabled = false; b.textContent = 'Begin Assessment →'; });
+  if (modalBeginBtn) { modalBeginBtn.disabled = false; modalBeginBtn.textContent = 'Begin Assessment →'; }
 
   // Extract text from uploaded files
   const rawTexts = [];
@@ -1277,24 +1469,22 @@ async function handleBeginAssessment() {
 
   hideLoader();
 
-  // Update the placeholder tab with real extracted data.
-  // Use saveTabAt(myTabIdx) instead of addOrUpdateTab so we always write to the
-  // correct tab regardless of what currentTabIdx is now (user may have clicked
-  // another tab during the long AI extraction).
-  const initialScore = compositeRuleBased(f, a, c, g);
+  const initialScore  = compositeRuleBased(f, a, c, g);
+  const concernsCount = hasEvidence
+    ? buildConcernsReportForTab({ evidence: parsed, f, a, c, g }).length
+    : 0;
+
   saveTabAt(myTabIdx, {
-    name:        extractedName,
-    score:       initialScore,
-    tierCls:     tier(initialScore).cls,
+    name:         extractedName,
+    score:        initialScore,
+    tierCls:      tier(initialScore).cls,
     f, a, c, g,
-    sourceDocs:  [...fileNames],
-    evidence:    currentEvidence ? { ...currentEvidence } : null,
+    sourceDocs:   [...fileNames],
+    evidence:     currentEvidence ? { ...currentEvidence } : null,
+    concernsCount,
   });
 
-  // Ensure the newly assessed tab is the active one so updateCard saves correctly
   currentTabIdx = myTabIdx;
-  renderTabs();
-
   updateCard();
 }
 
@@ -1531,7 +1721,6 @@ function recordDecision(decision) {
   const c = +document.getElementById('compliance').value;
   const g = +document.getElementById('geo').value;
 
-  // Use addOrUpdateTab so the merge in that function preserves concernsAddressed etc.
   addOrUpdateTab({
     name:        name === '—' ? 'Unnamed' : name,
     score, tierCls, f, a, c, g,
@@ -1541,6 +1730,7 @@ function recordDecision(decision) {
     subScores:   lastRenderData ? lastRenderData.subScores : null,
     explainText: document.getElementById('explainText').textContent,
   });
+  renderSupplierList();
 }
 
 function resetDecision() {
@@ -1559,56 +1749,6 @@ function concernKey(text) {
   return text.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '').slice(0, 60);
 }
 
-function markConcernAddressed(concern, key) {
-  if (currentTabIdx < 0) return;
-  const now = new Date();
-  const ts  = now.toLocaleDateString([], { day: '2-digit', month: 'short', year: 'numeric' }) +
-              ', ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-  const tab = supplierTabs[currentTabIdx];
-  const updated = {
-    ...(tab.addressedConcerns || {}),
-    [key]: { ts, text: concern.text, dimension: concern.dimension, severity: concern.severity },
-  };
-  saveCurrentTab({ addressedConcerns: updated });
-
-  // Update this concern's row in-place
-  const row = document.querySelector(`.concern-row[data-key="${CSS.escape(key)}"]`);
-  if (row) {
-    row.classList.add('addressed');
-    const btn = row.querySelector('.mark-one-btn');
-    if (btn) {
-      const check = document.createElement('span');
-      check.className = 'concern-addressed-check';
-      check.textContent = '✓';
-      btn.replaceWith(check);
-    }
-    const body = row.querySelector('.concern-body');
-    if (body && !body.querySelector('.concern-addressed-ts')) {
-      const tsEl = document.createElement('span');
-      tsEl.className   = 'concern-addressed-ts';
-      tsEl.textContent = `Addressed ${ts}`;
-      body.appendChild(tsEl);
-    }
-  }
-
-  // Refresh summary badge
-  refreshConcernsBadge();
-
-  // Individual audit-trail entry with expandable detail
-  appendHistory({
-    name:      tab.name || '—',
-    score:     tab.score || 0,
-    tierLabel: document.getElementById('tierBadge').textContent,
-    tierCls:   tab.tierCls || '',
-    decision:  'Concern addressed',
-    note:      concern.text,
-    fullTs:    ts,
-    detail:    { dimension: concern.dimension, severity: concern.severity, text: concern.text },
-  });
-
-  renderTabs(); // refresh addressed-count badge on the tab
-}
 
 function refreshConcernsBadge() {
   const badge = document.getElementById('concernsAddressedBadge');
@@ -1622,6 +1762,46 @@ function refreshConcernsBadge() {
   } else {
     badge.classList.add('hidden');
   }
+}
+
+function updateMarkSelectedBtn() {
+  const btn      = document.getElementById('btnMarkSelected');
+  const countEl  = document.getElementById('markSelectedCount');
+  if (!btn) return;
+  const checked = document.querySelectorAll('.concern-check:checked').length;
+  btn.disabled = checked === 0;
+  countEl.textContent = checked > 0 ? `(${checked})` : '';
+}
+
+function markSelectedConcernsAddressed() {
+  if (currentTabIdx < 0) return;
+  const checked = Array.from(document.querySelectorAll('.concern-check:checked'));
+  if (!checked.length) return;
+
+  const now = new Date();
+  const ts  = now.toLocaleDateString([], { day: '2-digit', month: 'short', year: 'numeric' }) +
+              ', ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  const tab = supplierTabs[currentTabIdx];
+  const updated = { ...(tab.addressedConcerns || {}) };
+
+  checked.forEach(cb => {
+    const key = cb.dataset.key;
+    const row = cb.closest('.concern-row');
+    if (!row || updated[key]) return;
+    // Derive concern metadata from the DOM row
+    const text = row.querySelector('.concern-text')?.textContent || '';
+    const dimension = row.querySelector('.concern-dim')?.textContent || '';
+    const sev = row.querySelector('.sev-badge')?.textContent || 'LOW';
+    updated[key] = { ts, text, dimension, severity: sev };
+  });
+
+  saveCurrentTab({ addressedConcerns: updated });
+
+  // Rebuild the concerns list to reflect new state
+  if (currentEvidence) renderConcernsReport(buildConcernsReport(currentEvidence));
+  refreshConcernsBadge();
+  renderSupplierList();
 }
 
 // ── Decision history ──────────────────────────────────────────────────────────
@@ -1711,12 +1891,11 @@ function initTooltips() {
   });
 }
 
-// ── Upload (landing page) ─────────────────────────────────────────────────────
+// ── Upload modal wiring ───────────────────────────────────────────────────────
 
-function initUpload() {
-  const input    = document.getElementById('docUpload');
-  const zone     = document.getElementById('landingDropZone');
-  const beginBtn = document.getElementById('beginBtn');
+function initUploadModal() {
+  const input   = document.getElementById('modalDocUpload');
+  const zone    = document.getElementById('modalDropZone');
 
   input.addEventListener('change', () => {
     Array.from(input.files).forEach(f => {
@@ -1724,7 +1903,7 @@ function initUpload() {
       if (ext === 'pdf' || ext === 'docx') uploadedFiles.push(f);
     });
     input.value = '';
-    updateLandingChips();
+    updateModalChips();
   });
 
   zone.addEventListener('dragover',  e => { e.preventDefault(); zone.classList.add('drag-over'); });
@@ -1736,77 +1915,90 @@ function initUpload() {
       const ext = f.name.split('.').pop().toLowerCase();
       if (ext === 'pdf' || ext === 'docx') uploadedFiles.push(f);
     });
-    updateLandingChips();
+    updateModalChips();
   });
 
-  beginBtn.addEventListener('click', handleBeginAssessment);
+  document.getElementById('modalBeginBtn').addEventListener('click', handleBeginAssessment);
 
-  document.getElementById('goManual').addEventListener('click', () => {
-    uploadedFiles = [];
-    updateLandingChips();
-    goToMain();
+  document.getElementById('uploadModalClose').addEventListener('click', hideUploadModal);
+  document.getElementById('uploadModalBackdrop').addEventListener('click', hideUploadModal);
+
+  document.getElementById('modalGoManual').addEventListener('click', () => {
+    hideUploadModal();
+    document.getElementById('listPage').style.display   = 'none';
+    document.getElementById('mainScreen').style.display = 'flex';
     resetMainScreen();
+    // Create a placeholder tab so manual edits are persisted
+    supplierTabs.push({
+      id: Date.now().toString(), name: 'New Supplier',
+      score: 0, tierCls: '', f: 0, a: 0, c: 0, g: 0,
+      sourceDocs: [], evidence: null, subScores: null, explainText: '',
+      decision: null, notes: '', bannerText: '', fullTs: '',
+      addressedConcerns: {}, dateAdded: Date.now(), concernsCount: 0,
+    });
+    currentTabIdx = supplierTabs.length - 1;
+    saveTabsToStorage();
+  });
+
+  // Close on Escape
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !document.getElementById('uploadModal').classList.contains('hidden')) {
+      hideUploadModal();
+    }
   });
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 document.addEventListener('DOMContentLoaded', () => {
+  // Detail view: slider inputs
   ['supplierName', 'financial', 'audit', 'compliance', 'geo'].forEach(id => {
     document.getElementById(id).addEventListener('input', updateCard);
   });
 
+  // Detail view: decision buttons
   document.getElementById('btnApprove').addEventListener('click',  () => recordDecision('Approve'));
   document.getElementById('btnEscalate').addEventListener('click', () => recordDecision('Escalate'));
   document.getElementById('btnReject').addEventListener('click',   () => recordDecision('Reject'));
   document.getElementById('btnReset').addEventListener('click', resetDecision);
   document.getElementById('btnExport').addEventListener('click', () => window.print());
 
-  // + New supplier button
-  document.getElementById('btnNewSupplier').addEventListener('click', () => {
-    uploadedFiles = [];
-    updateLandingChips();
-    if (supplierTabs.length > 0) {
-      showInlineUpload();
-    } else {
-      goToLanding();
+  // Detail view: back to list
+  document.getElementById('btnBackToList').addEventListener('click', () => {
+    clearTimeout(debounceTimer);
+    if (currentTabIdx >= 0) {
+      saveCurrentTab({
+        name: document.getElementById('supplierName').value.trim() || (supplierTabs[currentTabIdx] && supplierTabs[currentTabIdx].name),
+        f: +document.getElementById('financial').value,
+        a: +document.getElementById('audit').value,
+        c: +document.getElementById('compliance').value,
+        g: +document.getElementById('geo').value,
+      });
     }
+    goToList();
   });
 
-  // Inline upload panel wiring
-  const inlineInput  = document.getElementById('inlineDocUpload');
-  const inlineZone   = document.getElementById('inlineDropZone');
+  // List page: + New Supplier
+  document.getElementById('btnNewSupplierGlobal').addEventListener('click', showUploadModal);
 
-  inlineInput.addEventListener('change', () => {
-    Array.from(inlineInput.files).forEach(f => {
-      const ext = f.name.split('.').pop().toLowerCase();
-      if (ext === 'pdf' || ext === 'docx') uploadedFiles.push(f);
+  // List page: sort buttons
+  document.querySelectorAll('.sort-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.sort;
+      if (sortKey === key) {
+        sortDir = sortDir === 'desc' ? 'asc' : 'desc';
+      } else {
+        sortKey = key;
+        sortDir = 'desc';
+      }
+      renderSupplierList();
     });
-    inlineInput.value = '';
-    updateInlineChips();
   });
 
-  inlineZone.addEventListener('dragover',  e => { e.preventDefault(); inlineZone.classList.add('drag-over'); });
-  inlineZone.addEventListener('dragleave', () => inlineZone.classList.remove('drag-over'));
-  inlineZone.addEventListener('drop', e => {
-    e.preventDefault();
-    inlineZone.classList.remove('drag-over');
-    Array.from(e.dataTransfer.files).forEach(f => {
-      const ext = f.name.split('.').pop().toLowerCase();
-      if (ext === 'pdf' || ext === 'docx') uploadedFiles.push(f);
-    });
-    updateInlineChips();
-  });
+  // Mark selected concerns as addressed
+  document.getElementById('btnMarkSelected').addEventListener('click', markSelectedConcernsAddressed);
 
-  document.getElementById('inlineBeginBtn').addEventListener('click', handleBeginAssessment);
-
-  document.getElementById('inlineCancelBtn').addEventListener('click', hideInlineUpload);
-
-  document.getElementById('inlineGoManual').addEventListener('click', () => {
-    hideInlineUpload();
-    resetMainScreen();
-  });
-
+  // Export letter
   document.getElementById('btnExportLetter').addEventListener('click', () => {
     const name     = document.getElementById('cardName').textContent;
     const concerns = currentEvidence ? buildConcernsReport(currentEvidence) : [];
@@ -1818,11 +2010,9 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   initTooltips();
-  initUpload();
+  initUploadModal();
   loadTabsFromStorage();
 
-  // Warn when served over HTTPS (e.g. GitHub Pages) — Ollama on http://localhost
-  // is blocked as mixed content, so all AI calls will fall back to rule-based.
   if (window.location.protocol === 'https:') {
     const banner = document.createElement('div');
     banner.className = 'https-notice no-print';

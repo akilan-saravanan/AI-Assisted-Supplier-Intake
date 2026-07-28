@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Supplier Risk Scoring</title>
-  <link rel="stylesheet" href="styles.css?v=4" />
+  <link rel="stylesheet" href="styles.css?v=5" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/docx@7.8.2/build/index.js"></script>
@@ -16,59 +16,68 @@
 </head>
 <body>
 
-<!-- ══ LANDING PAGE ══════════════════════════════════════════════════════════ -->
-<div id="landingPage">
-  <div class="landing-card">
-    <div class="landing-logo">SR</div>
-    <h1 class="landing-title">Supplier Risk Scoring</h1>
-    <p class="landing-sub">AI-powered supplier intake — upload documents to begin</p>
+<!-- ══ LIST PAGE (home) ══════════════════════════════════════════════════════ -->
+<div id="listPage">
+  <header class="app-header">
+    <div class="logo">SR</div>
+    <h1>Supplier Risk Scoring <span>— POC</span></h1>
+    <button class="new-supplier-btn" id="btnNewSupplierGlobal" type="button">＋ New Supplier</button>
+  </header>
 
-    <label class="landing-drop-zone" for="docUpload" id="landingDropZone">
-      <span class="landing-drop-icon">▲</span>
-      <span class="landing-drop-title">Drop supplier documents here or click to upload</span>
-      <span class="landing-drop-sub">Supports PDF and Word (.docx) — upload multiple documents at once</span>
-      <input type="file" id="docUpload" accept=".pdf,.docx" multiple />
-    </label>
+  <div class="list-page-body">
+    <div class="list-toolbar" id="listToolbar">
+      <span class="list-count" id="listCount"></span>
+      <div class="sort-bar">
+        <span class="sort-label">Sort by</span>
+        <button class="sort-btn active" data-sort="date" type="button">Date added</button>
+        <button class="sort-btn" data-sort="name" type="button">Name</button>
+        <button class="sort-btn" data-sort="status" type="button">Status</button>
+        <button class="sort-btn" data-sort="concerns" type="button">Concerns</button>
+        <button class="sort-btn" data-sort="addressed" type="button">Addressed</button>
+      </div>
+    </div>
 
-    <div id="fileChipList" class="file-chip-list hidden"></div>
+    <div id="supplierListWrap" class="supplier-list-wrap"></div>
 
-    <button id="beginBtn" class="begin-btn" disabled>Begin Assessment →</button>
-
-    <span class="landing-manual-link" id="goManual">Or enter scores manually →</span>
+    <div id="listEmptyState" class="list-empty-state">
+      <div class="list-empty-icon">▲</div>
+      <h2 class="list-empty-heading">No suppliers yet</h2>
+      <p class="list-empty-sub">Click <strong>＋ New Supplier</strong> to begin your first assessment.</p>
+    </div>
   </div>
 </div>
 
-<!-- ══ MAIN SCREEN ═══════════════════════════════════════════════════════════ -->
-<div id="mainScreen" style="display:none">
-
-  <header>
-    <div class="logo">SR</div>
-    <h1>Supplier Risk Scoring <span>— POC</span></h1>
-    <button class="new-supplier-btn no-print" id="btnNewSupplier" type="button">＋ New supplier</button>
-  </header>
-
-  <div class="supplier-tabs-bar no-print" id="supplierTabsBar" style="display:none"></div>
-
-  <!-- ══ INLINE UPLOAD PANEL ═══════════════════════════════════════════════════ -->
-  <div id="inlineUploadPanel" class="inline-upload-panel hidden">
-    <div class="inline-upload-inner">
-      <div class="inline-upload-header">
-        <span class="inline-upload-title">New Supplier</span>
-        <button id="inlineCancelBtn" class="inline-cancel-btn" type="button" aria-label="Cancel">✕</button>
-      </div>
-      <label class="landing-drop-zone inline-drop-zone" for="inlineDocUpload" id="inlineDropZone">
-        <span class="landing-drop-icon">▲</span>
-        <span class="landing-drop-title">Drop documents here or click to upload</span>
-        <span class="landing-drop-sub">PDF or Word (.docx) — multiple files supported</span>
-        <input type="file" id="inlineDocUpload" accept=".pdf,.docx" multiple />
-      </label>
-      <div id="inlineFileChipList" class="file-chip-list hidden"></div>
-      <div class="inline-upload-footer">
-        <button id="inlineBeginBtn" class="begin-btn" disabled type="button">Begin Assessment →</button>
-        <span class="landing-manual-link" id="inlineGoManual">Or enter scores manually →</span>
-      </div>
+<!-- ══ UPLOAD MODAL ══════════════════════════════════════════════════════════ -->
+<div id="uploadModal" class="upload-modal hidden" role="dialog" aria-modal="true" aria-label="New Supplier">
+  <div class="upload-modal-backdrop" id="uploadModalBackdrop"></div>
+  <div class="upload-modal-card">
+    <div class="upload-modal-header">
+      <span class="upload-modal-title">New Supplier</span>
+      <button class="upload-modal-close" id="uploadModalClose" type="button" aria-label="Close">✕</button>
+    </div>
+    <label class="landing-drop-zone upload-modal-zone" for="modalDocUpload" id="modalDropZone">
+      <span class="landing-drop-icon">▲</span>
+      <span class="landing-drop-title">Drop supplier documents here or click to upload</span>
+      <span class="landing-drop-sub">Supports PDF and Word (.docx) — upload multiple documents at once</span>
+      <input type="file" id="modalDocUpload" accept=".pdf,.docx" multiple />
+    </label>
+    <div id="modalFileChipList" class="file-chip-list hidden"></div>
+    <div class="upload-modal-footer">
+      <button id="modalBeginBtn" class="begin-btn" disabled type="button">Begin Assessment →</button>
+      <span class="landing-manual-link" id="modalGoManual">Or enter scores manually →</span>
     </div>
   </div>
+</div>
+
+<!-- ══ DETAIL PAGE (reviewer dashboard) ══════════════════════════════════════ -->
+<div id="mainScreen" style="display:none">
+
+  <header class="app-header">
+    <button class="back-btn no-print" id="btnBackToList" type="button">← Suppliers</button>
+    <div class="logo">SR</div>
+    <h1>Supplier Risk Scoring</h1>
+    <button class="export-btn-header no-print" id="btnExport" type="button">⬇ Export PDF</button>
+  </header>
 
   <div class="layout">
 
@@ -124,11 +133,7 @@
     <main>
       <div class="card">
 
-        <div class="card-header-row">
-          <button class="export-btn no-print" id="btnExport" type="button">⬇ Export PDF</button>
-        </div>
-
-        <!-- Loading indicator (shared: document processing + AI scoring) -->
+        <!-- Loading indicator -->
         <div id="loadingIndicator" class="loading-indicator hidden" role="status" aria-live="polite">
           <div class="loading-spinner" aria-hidden="true"></div>
           <span id="loadingText" class="loading-text"></span>
@@ -214,7 +219,7 @@
 
   </div>
 
-  <!-- Evidence panel: per-dimension strengths & concerns from documents -->
+  <!-- Evidence panel -->
   <div id="evidenceSection" class="evidence-section hidden">
     <div class="section-bar">
       <h2 class="section-heading">Document Evidence</h2>
@@ -223,11 +228,12 @@
     <div id="evidenceGrid" class="evidence-grid"></div>
   </div>
 
-  <!-- Concerns report: aggregated, severity-sorted -->
+  <!-- Concerns report -->
   <div id="concernsSection" class="concerns-section hidden">
     <div class="section-bar">
       <h2 class="section-heading">Concerns Report</h2>
       <div class="concerns-actions no-print">
+        <button id="btnMarkSelected" class="mark-selected-btn" type="button" disabled>✓ Mark selected as addressed <span id="markSelectedCount"></span></button>
         <button id="btnExportLetter" class="export-letter-btn" type="button">⬇ Export Concerns Letter (.docx)</button>
       </div>
     </div>
@@ -258,6 +264,6 @@
 </div><!-- #mainScreen -->
 
 <div id="tooltip" class="dim-tooltip hidden" role="tooltip"></div>
-<script src="scoring.js?v=2"></script>
+<script src="scoring.js?v=4"></script>
 </body>
 </html>
