@@ -4,15 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Supplier Risk Scoring</title>
-  <link rel="stylesheet" href="styles.css?v=5" />
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/docx@7.8.2/build/index.js"></script>
-  <script>
-    if (typeof pdfjsLib !== 'undefined') {
-      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-    }
-  </script>
+  <!-- Preconnect so CDN DNS+TLS is negotiated before library scripts are requested (#3) -->
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com" />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <link rel="dns-prefetch" href="https://cdnjs.cloudflare.com" />
+  <link rel="dns-prefetch" href="https://cdn.jsdelivr.net" />
+  <link rel="stylesheet" href="styles.css?v=6" />
+  <!-- defer: downloads in parallel with HTML parsing, executes after parse completes (#4) -->
+  <script src="scoring.js?v=5" defer></script>
 </head>
 <body>
 
@@ -43,6 +42,20 @@
       <div class="list-empty-icon">▲</div>
       <h2 class="list-empty-heading">No suppliers yet</h2>
       <p class="list-empty-sub">Click <strong>＋ New Supplier</strong> to begin your first assessment.</p>
+    </div>
+  </div>
+</div>
+
+<!-- ══ CONFIRM MODAL ═════════════════════════════════════════════════════════ -->
+<div id="confirmModal" class="confirm-modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirmModalTitle">
+  <div class="confirm-modal-backdrop" id="confirmModalBackdrop"></div>
+  <div class="confirm-modal-card">
+    <div class="confirm-modal-icon" id="confirmModalIcon">⚠</div>
+    <h2 class="confirm-modal-title" id="confirmModalTitle"></h2>
+    <p class="confirm-modal-body" id="confirmModalBody"></p>
+    <div class="confirm-modal-actions">
+      <button class="confirm-modal-cancel" id="confirmModalCancel" type="button">Cancel</button>
+      <button class="confirm-modal-confirm" id="confirmModalConfirm" type="button"></button>
     </div>
   </div>
 </div>
@@ -264,6 +277,5 @@
 </div><!-- #mainScreen -->
 
 <div id="tooltip" class="dim-tooltip hidden" role="tooltip"></div>
-<script src="scoring.js?v=4"></script>
 </body>
 </html>

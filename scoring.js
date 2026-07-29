@@ -15,6 +15,41 @@ const DIM_META = [
 const OLLAMA_URL   = 'http://localhost:11434/api/generate';
 const OLLAMA_MODEL = 'mistral';
 
+// ── Lazy library loader (#1) ──────────────────────────────────────────────────
+// mammoth / pdf.js / docx are only needed when the user uploads documents.
+// Loading them on demand (not in <head>) lets the list page render instantly.
+
+let _libsLoaded  = false;
+let _libsPromise = null;
+
+function loadLibraries() {
+  if (_libsLoaded)  return Promise.resolve();
+  if (_libsPromise) return _libsPromise;
+
+  const CDN = [
+    'https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
+    'https://cdn.jsdelivr.net/npm/docx@7.8.2/build/index.js',
+  ];
+
+  _libsPromise = Promise.all(CDN.map(src => new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src     = src;
+    s.onload  = resolve;
+    s.onerror = () => reject(new Error(`Failed to load ${src}`));
+    document.head.appendChild(s);
+  }))).then(() => {
+    // Configure pdf.js worker after pdf.js itself is loaded
+    if (typeof pdfjsLib !== 'undefined') {
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    }
+    _libsLoaded = true;
+  });
+
+  return _libsPromise;
+}
+
 let currentAbortController = null;
 let debounceTimer = null;
 
@@ -885,6 +920,50 @@ function goToDetail(idx) {
   }
 }
 
+// ── Reusable confirm modal ────────────────────────────────────────────────────
+
+function confirmModal({ title, body, confirmLabel = 'Delete', icon = '⚠', onConfirm }) {
+  const modal      = document.getElementById('confirmModal');
+  const titleEl    = document.getElementById('confirmModalTitle');
+  const bodyEl     = document.getElementById('confirmModalBody');
+  const confirmBtn = document.getElementById('confirmModalConfirm');
+  const cancelBtn  = document.getElementById('confirmModalCancel');
+  const backdrop   = document.getElementById('confirmModalBackdrop');
+  const iconEl     = document.getElementById('confirmModalIcon');
+
+  titleEl.textContent    = title;
+  bodyEl.textContent     = body;
+  confirmBtn.textContent = confirmLabel;
+  iconEl.textContent     = icon;
+
+  modal.classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+  cancelBtn.focus();
+
+  function close() {
+    modal.classList.add('hidden');
+    document.body.style.overflow = '';
+    confirmBtn.removeEventListener('click', handleConfirm);
+    cancelBtn.removeEventListener('click', close);
+    backdrop.removeEventListener('click', close);
+    document.removeEventListener('keydown', handleKey);
+  }
+
+  function handleConfirm() {
+    close();
+    onConfirm();
+  }
+
+  function handleKey(e) {
+    if (e.key === 'Escape') close();
+  }
+
+  confirmBtn.addEventListener('click', handleConfirm);
+  cancelBtn.addEventListener('click', close);
+  backdrop.addEventListener('click', close);
+  document.addEventListener('keydown', handleKey);
+}
+
 // ── Addressed-pill color ──────────────────────────────────────────────────────
 
 function addressedPillStyle(addressed, total) {
@@ -900,10 +979,18 @@ function addressedPillStyle(addressed, total) {
 function deleteSupplier(idx) {
   const tab = supplierTabs[idx];
   if (!tab) return;
-  if (!confirm(`Delete "${tab.name || 'this supplier'}"? This cannot be undone.`)) return;
-  supplierTabs.splice(idx, 1);
-  saveTabsToStorage();
-  renderSupplierList();
+  const name = tab.name || 'this supplier';
+  confirmModal({
+    title:         `Delete "${name}"?`,
+    body:          `This will permanently remove all associated documents, evidence, and decision history. This cannot be undone.`,
+    confirmLabel:  'Delete',
+    icon:          '⚠',
+    onConfirm() {
+      supplierTabs.splice(idx, 1);
+      saveTabsToStorage();
+      renderSupplierList();
+    },
+  });
 }
 
 function exportSupplierSummaryFromList(idx) {
@@ -1339,6 +1426,18 @@ async function handleBeginAssessment() {
   const fileNames   = uploadedFiles.map(f => f.name);
   const filesForExt = [...uploadedFiles];
   uploadedFiles = [];
+
+  // Load document libraries on demand — show status in the button (#1, #5)
+  if (!_libsLoaded) {
+    if (modalBeginBtn) { modalBeginBtn.disabled = true; modalBeginBtn.textContent = 'Loading libraries…'; }
+    try {
+      await loadLibraries();
+    } catch {
+      if (modalBeginBtn) { modalBeginBtn.disabled = false; modalBeginBtn.textContent = 'Begin Assessment →'; }
+      alert('Could not load required libraries. Check your internet connection and try again.');
+      return;
+    }
+  }
 
   if (modalBeginBtn) { modalBeginBtn.disabled = true; modalBeginBtn.textContent = 'Extracting…'; }
 
