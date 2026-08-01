@@ -4,14 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Supplier Risk Scoring</title>
-  <!-- Preconnect so CDN DNS+TLS is negotiated before library scripts are requested (#3) -->
-  <link rel="preconnect" href="https://cdnjs.cloudflare.com" />
-  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <!-- dns-prefetch only: CDN libs load lazily on user action; preconnect expires (~10s) before use -->
   <link rel="dns-prefetch" href="https://cdnjs.cloudflare.com" />
   <link rel="dns-prefetch" href="https://cdn.jsdelivr.net" />
-  <link rel="stylesheet" href="styles.css?v=6" />
+  <link rel="stylesheet" href="styles.css?v=11" />
   <!-- defer: downloads in parallel with HTML parsing, executes after parse completes (#4) -->
-  <script src="scoring.js?v=5" defer></script>
+  <script src="scoring.js?v=10" defer></script>
 </head>
 <body>
 
@@ -24,24 +22,68 @@
   </header>
 
   <div class="list-page-body">
-    <div class="list-toolbar" id="listToolbar">
-      <span class="list-count" id="listCount"></span>
-      <div class="sort-bar">
-        <span class="sort-label">Sort by</span>
-        <button class="sort-btn active" data-sort="date" type="button">Date added</button>
-        <button class="sort-btn" data-sort="name" type="button">Name</button>
-        <button class="sort-btn" data-sort="status" type="button">Status</button>
-        <button class="sort-btn" data-sort="concerns" type="button">Concerns</button>
-        <button class="sort-btn" data-sort="addressed" type="button">Addressed</button>
+    <aside class="list-sidebar" id="listSidebar">
+      <div id="statusChart" class="status-chart hidden"></div>
+    </aside>
+
+    <div class="list-main">
+      <div class="list-toolbar" id="listToolbar">
+        <div class="list-search-wrap">
+          <svg class="list-search-icon" width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true"><circle cx="6" cy="6" r="4.25" stroke="#94a3b8" stroke-width="1.5"/><path d="M9.5 9.5L12.5 12.5" stroke="#94a3b8" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <input type="search" id="listSearch" class="list-search-input" placeholder="Search suppliers…" autocomplete="off" />
+          <button id="listSearchClear" class="list-search-clear" type="button" aria-label="Clear search">✕</button>
+        </div>
+        <span class="list-count" id="listCount"></span>
+        <div class="sort-bar">
+          <span class="sort-label">Sort by</span>
+          <button class="sort-btn active" data-sort="date" type="button">Date added</button>
+          <button class="sort-btn" data-sort="name" type="button">Name</button>
+          <button class="sort-btn" data-sort="status" type="button">Status</button>
+          <button class="sort-btn" data-sort="concerns" type="button">Concerns</button>
+          <button class="sort-btn" data-sort="addressed" type="button">Addressed</button>
+        </div>
+      </div>
+
+      <div id="supplierListWrap" class="supplier-list-wrap"></div>
+
+      <div id="listEmptyState" class="list-empty-state">
+        <div class="list-empty-icon">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <rect x="8" y="6" width="28" height="36" rx="3" stroke="#cbd5e1" stroke-width="2.5" fill="none"/>
+            <path d="M15 16h18M15 22h18M15 28h12" stroke="#cbd5e1" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <h2 class="list-empty-heading">No suppliers yet</h2>
+        <p class="list-empty-sub">Click <strong>＋ New Supplier</strong> to begin your first assessment.</p>
       </div>
     </div>
+  </div>
+</div>
 
-    <div id="supplierListWrap" class="supplier-list-wrap"></div>
+<!-- ══ APPROVAL MODAL ════════════════════════════════════════════════════════ -->
+<div id="approvalModal" class="approval-modal hidden" role="dialog" aria-modal="true" aria-labelledby="approvalModalTitle">
+  <div class="approval-modal-backdrop" id="approvalModalBackdrop"></div>
+  <div class="approval-modal-card">
+    <div class="approval-modal-header">
+      <span class="approval-modal-icon">✅</span>
+      <h2 class="approval-modal-title" id="approvalModalTitle">Approve Supplier</h2>
+    </div>
+    <div class="approval-modal-body">
+      <label class="approval-field-label" for="approvedBecauseField">Approved Because <span class="approval-required">*</span></label>
+      <textarea id="approvedBecauseField" class="approval-textarea" rows="3" placeholder="Enter the justification for approving this supplier…"></textarea>
 
-    <div id="listEmptyState" class="list-empty-state">
-      <div class="list-empty-icon">▲</div>
-      <h2 class="list-empty-heading">No suppliers yet</h2>
-      <p class="list-empty-sub">Click <strong>＋ New Supplier</strong> to begin your first assessment.</p>
+      <label class="approval-field-label">Supporting Document <span class="approval-required">*</span></label>
+      <label class="approval-doc-zone" for="approvalDocInput" id="approvalDocZone">
+        <span class="approval-doc-icon">📎</span>
+        <span class="approval-doc-text">Click to attach a document (PDF or Word)</span>
+        <input type="file" id="approvalDocInput" accept=".pdf,.docx" />
+      </label>
+      <div id="approvalDocChip" class="approval-doc-chip hidden"></div>
+      <p id="approvalValidationMsg" class="approval-validation hidden">Please fill in the justification and attach a supporting document.</p>
+    </div>
+    <div class="approval-modal-actions">
+      <button class="approval-modal-cancel" id="approvalModalCancel" type="button">Cancel</button>
+      <button class="approval-modal-confirm" id="approvalModalConfirm" type="button">Confirm Approval</button>
     </div>
   </div>
 </div>
@@ -69,7 +111,7 @@
       <button class="upload-modal-close" id="uploadModalClose" type="button" aria-label="Close">✕</button>
     </div>
     <label class="landing-drop-zone upload-modal-zone" for="modalDocUpload" id="modalDropZone">
-      <span class="landing-drop-icon">▲</span>
+      <svg class="landing-drop-icon" width="36" height="36" viewBox="0 0 36 36" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M18 24V12M18 12L13 17M18 12L23 17" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M9 26h18" stroke="#94a3b8" stroke-width="2" stroke-linecap="round"/></svg>
       <span class="landing-drop-title">Drop supplier documents here or click to upload</span>
       <span class="landing-drop-sub">Supports PDF and Word (.docx) — upload multiple documents at once</span>
       <input type="file" id="modalDocUpload" accept=".pdf,.docx" multiple />
@@ -77,7 +119,7 @@
     <div id="modalFileChipList" class="file-chip-list hidden"></div>
     <div class="upload-modal-footer">
       <button id="modalBeginBtn" class="begin-btn" disabled type="button">Begin Assessment →</button>
-      <span class="landing-manual-link" id="modalGoManual">Or enter scores manually →</span>
+      <button class="landing-manual-btn" id="modalGoManual" type="button">Enter scores manually without documents</button>
     </div>
   </div>
 </div>
@@ -89,18 +131,23 @@
     <button class="back-btn no-print" id="btnBackToList" type="button">← Suppliers</button>
     <div class="logo">SR</div>
     <h1>Supplier Risk Scoring</h1>
-    <button class="export-btn-header no-print" id="btnExport" type="button">⬇ Export PDF</button>
+    <button class="export-btn-header no-print" id="btnExport" type="button">Print / Save as PDF</button>
   </header>
 
   <div class="layout">
 
     <!-- LEFT: Sliders -->
-    <aside>
+    <aside id="sliderPanel">
       <div id="uploadStatus" class="upload-status-main"></div>
 
       <div id="manualInputs">
         <div class="panel">
           <div class="panel-title">Supplier Input</div>
+
+          <div class="ai-mode-bar hidden" id="aiModeBar">
+            <span class="ai-mode-label" id="aiModeLabel">AI-assessed</span>
+            <span class="ai-mode-hint">Drag a slider to override</span>
+          </div>
 
           <div class="field">
             <label for="supplierName">Supplier name</label>
@@ -203,6 +250,11 @@
         <div class="explain-block">
           <div class="explain-title">Why this score</div>
           <p id="explainText">—</p>
+          <button class="score-history-toggle hidden no-print" id="scoreHistoryToggle" type="button" aria-expanded="false">
+            <span id="scoreHistoryLabel">Score history</span>
+            <span class="score-history-arrow" id="scoreHistoryArrow" aria-hidden="true">▶</span>
+          </button>
+          <div class="score-history-list hidden" id="scoreHistoryList" role="list"></div>
         </div>
 
         <div class="rec-block">
@@ -246,7 +298,10 @@
     <div class="section-bar">
       <h2 class="section-heading">Concerns Report</h2>
       <div class="concerns-actions no-print">
-        <button id="btnMarkSelected" class="mark-selected-btn" type="button" disabled>✓ Mark selected as addressed <span id="markSelectedCount"></span></button>
+        <div class="mark-selected-wrap">
+          <button id="btnMarkSelected" class="mark-selected-btn" type="button" disabled>✓ Mark selected as addressed <span id="markSelectedCount"></span></button>
+          <span id="markSelectedHint" class="mark-selected-hint" style="display:none">You'll need a written justification and a supporting document (PDF or Word).</span>
+        </div>
         <button id="btnExportLetter" class="export-letter-btn" type="button">⬇ Export Concerns Letter (.docx)</button>
       </div>
     </div>
@@ -277,5 +332,21 @@
 </div><!-- #mainScreen -->
 
 <div id="tooltip" class="dim-tooltip hidden" role="tooltip"></div>
+
+<!-- ══ DOCUMENT VIEWER MODAL ═════════════════════════════════════════════════ -->
+<div id="docViewerModal" class="doc-viewer-modal hidden" role="dialog" aria-modal="true" aria-labelledby="docViewerTitle">
+  <div class="doc-viewer-backdrop" id="docViewerBackdrop"></div>
+  <div class="doc-viewer-card">
+    <div class="doc-viewer-header">
+      <span class="doc-viewer-title" id="docViewerTitle">Source Document</span>
+      <button class="doc-viewer-close" id="docViewerClose" type="button" aria-label="Close">✕</button>
+    </div>
+    <div class="doc-viewer-snippet hidden" id="docViewerSnippet"></div>
+    <div class="doc-viewer-body" id="docViewerBody"></div>
+  </div>
+</div>
+
+<div class="app-version" id="appVersion"></div>
+<div id="toastContainer" class="toast-container"></div>
 </body>
 </html>

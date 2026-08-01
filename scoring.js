@@ -1,3 +1,5 @@
+const APP_VERSION = 'v1.2';
+
 const WEIGHTS = {
   financial: 0.35,
   audit: 0.25,
@@ -22,6 +24,8 @@ const OLLAMA_MODEL = 'mistral';
 let _libsLoaded  = false;
 let _libsPromise = null;
 
+// Loads mammoth + pdf.js — needed at assessment start.
+// docx is NOT included here; it's loaded separately on first export (see loadDocxLibrary).
 function loadLibraries() {
   if (_libsLoaded)  return Promise.resolve();
   if (_libsPromise) return _libsPromise;
@@ -29,7 +33,6 @@ function loadLibraries() {
   const CDN = [
     'https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js',
     'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
-    'https://cdn.jsdelivr.net/npm/docx@7.8.2/build/index.js',
   ];
 
   _libsPromise = Promise.all(CDN.map(src => new Promise((resolve, reject) => {
@@ -39,7 +42,6 @@ function loadLibraries() {
     s.onerror = () => reject(new Error(`Failed to load ${src}`));
     document.head.appendChild(s);
   }))).then(() => {
-    // Configure pdf.js worker after pdf.js itself is loaded
     if (typeof pdfjsLib !== 'undefined') {
       pdfjsLib.GlobalWorkerOptions.workerSrc =
         'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -48,6 +50,23 @@ function loadLibraries() {
   });
 
   return _libsPromise;
+}
+
+// Loads the docx export library on demand (~500KB). Only called when the user exports a .docx.
+let _docxLoaded  = false;
+let _docxPromise = null;
+
+function loadDocxLibrary() {
+  if (_docxLoaded)  return Promise.resolve();
+  if (_docxPromise) return _docxPromise;
+  _docxPromise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src     = 'https://cdn.jsdelivr.net/npm/docx@7.8.2/build/index.js';
+    s.onload  = () => { _docxLoaded = true; resolve(); };
+    s.onerror = () => reject(new Error('Failed to load docx library'));
+    document.head.appendChild(s);
+  });
+  return _docxPromise;
 }
 
 let currentAbortController = null;
@@ -61,19 +80,30 @@ let currentTabIdx    = -1;
 let lastRenderData   = null;
 let currentEvidence  = null;  // evidence extracted from documents
 
-// List page sort state
-let sortKey = 'date';   // 'date' | 'status' | 'concerns' | 'addressed'
-let sortDir = 'desc';   // 'asc' | 'desc'
+// List page sort + search state
+let sortKey        = 'date';   // 'date' | 'status' | 'concerns' | 'addressed'
+let sortDir        = 'desc';   // 'asc' | 'desc'
+let listSearchQuery = '';      // live filter by supplier name
 
 // ── localStorage persistence ──────────────────────────────────────────────────
 
 const LS_TABS   = 'srisk_tabs';
 const LS_ACTIVE = 'srisk_activeTab';
+const LS_RAWDOCS_PREFIX = 'srisk_rawdocs_';
 
 function saveTabsToStorage() {
   try {
-    localStorage.setItem(LS_TABS,   JSON.stringify(supplierTabs));
+    // Strip rawDocTexts from the main blob — they're stored separately per tab ID.
+    // This keeps the main serialization small (metadata only) even with many suppliers.
+    const stripped = supplierTabs.map(({ rawDocTexts, ...rest }) => rest);
+    localStorage.setItem(LS_TABS,   JSON.stringify(stripped));
     localStorage.setItem(LS_ACTIVE, String(currentTabIdx));
+    supplierTabs.forEach(tab => {
+      if (!tab.id) return;
+      if (tab.rawDocTexts) {
+        try { localStorage.setItem(LS_RAWDOCS_PREFIX + tab.id, JSON.stringify(tab.rawDocTexts)); } catch {}
+      }
+    });
   } catch {}
 }
 
@@ -90,9 +120,18 @@ function loadTabsFromStorage() {
       if (tab.concernsCount == null && tab.evidence) {
         try { concernsCount = buildConcernsReportForTab(tab).length; } catch {}
       }
+      // Rehydrate rawDocTexts from its separate key (fall back to inline for old data)
+      let rawDocTexts = tab.rawDocTexts || null;
+      if (!rawDocTexts && tab.id) {
+        try {
+          const raw = localStorage.getItem(LS_RAWDOCS_PREFIX + tab.id);
+          if (raw) rawDocTexts = JSON.parse(raw);
+        } catch {}
+      }
       return {
         addressedConcerns: {},
         ...tab,
+        rawDocTexts,
         dateAdded:     tab.dateAdded != null ? tab.dateAdded : (now - (tabs.length - i) * 60000),
         concernsCount,
       };
@@ -105,6 +144,9 @@ function loadTabsFromStorage() {
 
 function clearAllTabs() {
   if (!confirm('Clear all saved suppliers? This cannot be undone.')) return;
+  supplierTabs.forEach(tab => {
+    if (tab.id) try { localStorage.removeItem(LS_RAWDOCS_PREFIX + tab.id); } catch {}
+  });
   supplierTabs  = [];
   currentTabIdx = -1;
   try { localStorage.removeItem(LS_TABS); localStorage.removeItem(LS_ACTIVE); } catch {}
@@ -144,9 +186,9 @@ function tier(score) {
 }
 
 function recommendation(score) {
-  if (score >= 70) return { label: 'Approve',              cls: 'rec-approve'     };
-  if (score >= 40) return { label: 'Conditional approval', cls: 'rec-conditional' };
-  return               { label: 'Reject',               cls: 'rec-reject'      };
+  if (score >= 70) return { label: 'Suggested: Approve',     cls: 'rec-approve'     };
+  if (score >= 40) return { label: 'Suggested: Conditional', cls: 'rec-conditional' };
+  return               { label: 'Suggested: Reject',     cls: 'rec-reject'      };
 }
 
 function confidence(f, a, c, g) {
@@ -154,9 +196,9 @@ function confidence(f, a, c, g) {
   const avg = vals.reduce((a, b) => a + b, 0) / 4;
   const variance = vals.reduce((sum, v) => sum + Math.pow(v - avg, 2), 0) / 4;
   const stdDev = Math.sqrt(variance);
-  if (stdDev < 10) return { label: 'High confidence',   cls: 'conf-high' };
-  if (stdDev > 22) return { label: 'Low confidence',    cls: 'conf-low'  };
-  return               { label: 'Medium confidence', cls: 'conf-mid'  };
+  if (stdDev < 10) return { label: 'Consistent profile', cls: 'conf-high' };
+  if (stdDev > 22) return { label: 'Variable profile',   cls: 'conf-low'  };
+  return               { label: 'Mixed profile',     cls: 'conf-mid'  };
 }
 
 // ── Ollama API ────────────────────────────────────────────────────────────────
@@ -451,7 +493,7 @@ async function extractNameWithRAG(index, signal) {
 async function extractWithRAG(rawTexts, signal) {
   const t0 = performance.now();
 
-  showLoader(`Building document chunks…`);
+  showLoader('Reading your documents…');
   const allChunks = [];
   for (const { text, fileName } of rawTexts) {
     const stripped = stripBoilerplate(text);
@@ -459,12 +501,12 @@ async function extractWithRAG(rawTexts, signal) {
   }
   console.log(`[RAG] total chunks: ${allChunks.length}`);
 
-  showLoader(`Embedding ${allChunks.length} chunks…`);
+  showLoader('Identifying key information…');
   const t1 = performance.now();
   const index = await buildIndex(allChunks, signal);
   console.log(`[RAG] embedding done in ${((performance.now() - t1) / 1000).toFixed(1)}s`);
 
-  showLoader('Extracting company name + all dimensions (parallel)…');
+  showLoader('Analysing risk across 4 dimensions…');
   const t2 = performance.now();
 
   const dims = [
@@ -540,37 +582,68 @@ function renderEvidencePanel(evidence, fileNames) {
   const noteEl   = document.getElementById('evidenceNote');
 
   section.classList.remove('hidden');
-  noteEl.textContent = `Based on: ${fileNames.join(', ')}`;
+  noteEl.innerHTML = 'Based on: ' + fileNames.map(n => `<span class="evidence-file-chip">${escHtml(n)}</span>`).join('');
 
-  grid.innerHTML = DIM_META.map(dim => {
-    const strengths = evidence[dim.id + '_strengths'] || [];
-    const concerns  = evidence[dim.id + '_concerns']  || [];
-    const score     = +document.getElementById(dim.id).value;
-    const scoreColor = score >= 70 ? '#15803d' : score >= 40 ? '#b45309' : '#b91c1c';
+  const tab       = currentTabIdx >= 0 ? supplierTabs[currentTabIdx] : null;
+  const addressed = (tab && tab.addressedConcerns) || {};
 
-    const listItems = (items, icon, cls) => {
-      if (!items.length) {
-        return `<li class="ev-empty">None found in documents</li>`;
-      }
-      return items.map(t => `<li class="${cls}">${icon} ${escHtml(t)}</li>`).join('');
-    };
+  grid.innerHTML = '';
+  grid.insertAdjacentHTML('beforeend', DIM_META.map(dim => {
+    const strengths  = evidence[dim.id + '_strengths'] || [];
+    const concerns   = evidence[dim.id + '_concerns']  || [];
+    const baseScore  = +document.getElementById(dim.id).value;
+    const dispScore  = tab && tab.addressedSubScores ? (tab.addressedSubScores[dim.id] ?? baseScore) : baseScore;
+    const scoreColor = dispScore >= 70 ? '#15803d' : dispScore >= 40 ? '#b45309' : '#b91c1c';
+
+    const strengthItems = strengths.length
+      ? strengths.map(t => {
+          const displayText = parseConcernSnippet(t);
+          const srcFile     = parseConcernFileName(t);
+          return `<li class="ev-strength">${escHtml(displayText)}` +
+            (srcFile ? `<span class="concern-source-chip">📎 ${escHtml(srcFile)}</span>` : '') + `</li>`;
+        }).join('')
+      : `<li class="ev-empty">None found in documents</li>`;
+
+    const concernItems = concerns.length
+      ? concerns.map(t => {
+          const key         = concernKey(t.trim());
+          const done        = !!addressed[key];
+          const displayText = parseConcernSnippet(t);
+          const srcFile     = parseConcernFileName(t);
+          const chipHtml    = srcFile ? `<span class="concern-source-chip">📎 ${escHtml(srcFile)}</span>` : '';
+          if (done) {
+            return `<li class="ev-concern">` +
+              `<span class="ev-concern-addressed-wrap">` +
+              `<button class="ev-concern-view-btn ev-concern-text-addressed" type="button" data-concern="${escHtml(t)}">${escHtml(displayText)}</button>` +
+              chipHtml +
+              `<span class="ev-concern-addressed-badge">✓ Addressed</span>` +
+              `</span></li>`;
+          }
+          return `<li class="ev-concern"><button class="ev-concern-view-btn" type="button" data-concern="${escHtml(t)}">${escHtml(displayText)}</button>${chipHtml}</li>`;
+        }).join('')
+      : `<li class="ev-empty">None found in documents</li>`;
 
     return `
       <div class="ev-card" data-dim="${dim.id}">
         <div class="ev-card-header">
           <span class="ev-dim-label">${escHtml(dim.label)}</span>
-          <span class="ev-score" style="color:${scoreColor}">${score}</span>
+          <span class="ev-score" style="color:${scoreColor}">${dispScore}</span>
         </div>
         <div class="ev-section">
           <div class="ev-section-title ev-strengths-title">✓ Strengths found</div>
-          <ul class="ev-list">${listItems(strengths, '', 'ev-strength')}</ul>
+          <ul class="ev-list">${strengthItems}</ul>
         </div>
         <div class="ev-section">
           <div class="ev-section-title ev-concerns-title">⚠ Concerns found</div>
-          <ul class="ev-list">${listItems(concerns, '', 'ev-concern')}</ul>
+          <ul class="ev-list">${concernItems}</ul>
         </div>
       </div>`;
-  }).join('');
+  }).join(''));
+
+  // Wire concern-view click handlers (open document viewer)
+  grid.querySelectorAll('.ev-concern-view-btn').forEach(btn => {
+    btn.addEventListener('click', () => openDocViewer(btn.dataset.concern, currentTabIdx));
+  });
 }
 
 // ── Concerns report ───────────────────────────────────────────────────────────
@@ -579,6 +652,16 @@ function getSeverity(dimScore) {
   if (dimScore < 40) return 'HIGH';
   if (dimScore < 65) return 'MEDIUM';
   return 'LOW';
+}
+
+// Elevates severity based on the concern text content, overriding the dimension-score default.
+function getSeverityFromText(text, dimScore) {
+  const t = text.toLowerCase();
+  const highSignals = ['fine', 'sanction', 'enforcement action', 'criminal', 'insolvency', 'prosecution', 'suspended operations', 'ceased operations', 'fatality', 'fatal incident'];
+  const medSignals  = ['non-conformance', 'ncr', 'major finding', 'critical', 'overdue', 'lapsed', 'expired certification', 'warning letter', 'corrective action'];
+  if (highSignals.some(s => t.includes(s))) return 'HIGH';
+  if (medSignals.some(s => t.includes(s))) return 'MEDIUM';
+  return getSeverity(dimScore);
 }
 
 function buildConcernsReport(evidence) {
@@ -593,7 +676,7 @@ function buildConcernsReport(evidence) {
         concerns.push({
           dimension: dim.label,
           text: text.trim(),
-          severity: getSeverity(score),
+          severity: getSeverityFromText(text.trim(), score),
           dimScore: score,
         });
       }
@@ -661,12 +744,19 @@ function renderConcernsReport(concerns) {
     badge.className   = `sev-badge ${sm.cls}`;
     badge.textContent = sm.label;
 
+    const displayText = parseConcernSnippet(c.text);
+    const srcFile     = parseConcernFileName(c.text);
     const body = document.createElement('div');
     body.className = 'concern-body';
     body.innerHTML =
       `<span class="concern-dim">${escHtml(c.dimension)}</span>` +
-      `<span class="concern-text">${escHtml(c.text)}</span>` +
+      `<button class="concern-text concern-view-btn" type="button" data-concern="${escHtml(c.text)}">${escHtml(displayText)}</button>` +
+      (srcFile ? `<span class="concern-source-chip">📎 ${escHtml(srcFile)}</span>` : '') +
       (done ? `<span class="concern-addressed-ts">Addressed ${escHtml(addressed[key].ts)}</span>` : '');
+    body.querySelector('.concern-view-btn').addEventListener('click', e => {
+      e.stopPropagation();
+      openDocViewer(c.text, currentTabIdx);
+    });
 
     if (done) {
       const check = document.createElement('span');
@@ -687,6 +777,12 @@ function renderConcernsReport(concerns) {
 // ── Concerns letter export (.docx) ────────────────────────────────────────────
 
 async function exportConcernsLetter(supplierName, concerns) {
+  try {
+    await loadDocxLibrary();
+  } catch {
+    alert('Word export library could not be loaded. Please check your internet connection and try again.');
+    return;
+  }
   if (typeof window.docx === 'undefined') {
     alert('Word export library not loaded. Please check your internet connection and try again.');
     return;
@@ -986,6 +1082,8 @@ function deleteSupplier(idx) {
     confirmLabel:  'Delete',
     icon:          '⚠',
     onConfirm() {
+      const delTab = supplierTabs[idx];
+      if (delTab && delTab.id) try { localStorage.removeItem(LS_RAWDOCS_PREFIX + delTab.id); } catch {}
       supplierTabs.splice(idx, 1);
       saveTabsToStorage();
       renderSupplierList();
@@ -1060,6 +1158,73 @@ function exportConcernsLetterForTab(idx) {
   exportConcernsLetter(tab.name || 'Supplier', concerns);
 }
 
+// ── Status chart ──────────────────────────────────────────────────────────────
+
+function renderStatusChart() {
+  const el = document.getElementById('statusChart');
+  if (!el) return;
+
+  if (!supplierTabs.length) {
+    el.classList.add('hidden');
+    return;
+  }
+
+  const counts = { Approve: 0, Escalate: 0, Reject: 0, Pending: 0 };
+  supplierTabs.forEach(tab => {
+    const k = tab.decision || 'Pending';
+    if (counts[k] !== undefined) counts[k]++;
+    else counts.Pending++;
+  });
+
+  const total = supplierTabs.length;
+  const segments = [
+    { key: 'Approve',  label: 'Approved',  color: '#16a34a' },
+    { key: 'Escalate', label: 'Escalated', color: '#d97706' },
+    { key: 'Reject',   label: 'Rejected',  color: '#dc2626' },
+    { key: 'Pending',  label: 'Pending',   color: '#94a3b8' },
+  ];
+
+  // SVG donut: r=40, cx=cy=50, stroke-width=20 → inner r=30
+  const r = 40;
+  const cx = 50;
+  const cy = 50;
+  const circumference = 2 * Math.PI * r;
+
+  let offset = 0;
+  const paths = segments.map(seg => {
+    const frac  = total > 0 ? counts[seg.key] / total : 0;
+    const dash  = frac * circumference;
+    const gap   = circumference - dash;
+    const el    = `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${seg.color}" stroke-width="20"` +
+                  ` stroke-dasharray="${dash.toFixed(2)} ${gap.toFixed(2)}"` +
+                  ` stroke-dashoffset="${(-offset).toFixed(2)}"` +
+                  ` transform="rotate(-90 ${cx} ${cy})" />`;
+    offset += dash;
+    return el;
+  }).join('');
+
+  const legendRows = segments.map(seg => {
+    const pct = total > 0 ? Math.round((counts[seg.key] / total) * 100) : 0;
+    return `<div class="status-legend-row">` +
+      `<span class="status-legend-dot" style="background:${seg.color}"></span>` +
+      `<span class="status-legend-label">${seg.label}</span>` +
+      `<span class="status-legend-count">${counts[seg.key]}</span>` +
+      `<span class="status-legend-pct">${pct}%</span>` +
+      `</div>`;
+  }).join('');
+
+  el.classList.remove('hidden');
+  el.innerHTML =
+    `<div class="status-chart-title">Supplier Status</div>` +
+    `<svg class="status-chart-donut" width="100" height="116" viewBox="0 0 100 116">` +
+    `<circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#f1f5f9" stroke-width="20"/>` +
+    paths +
+    `<text x="${cx}" y="${cy - 6}" text-anchor="middle" dominant-baseline="central" font-size="18" font-weight="700" fill="#1e293b">${total}</text>` +
+    `<text x="${cx}" y="${cy + 12}" text-anchor="middle" font-size="9" fill="#94a3b8" letter-spacing="0.04em">SUPPLIERS</text>` +
+    `</svg>` +
+    `<div class="status-chart-legend">${legendRows}</div>`;
+}
+
 // ── Supplier list rendering ───────────────────────────────────────────────────
 
 function renderSupplierList() {
@@ -1080,10 +1245,12 @@ function renderSupplierList() {
   toolbar.style.visibility = '';
   countEl.textContent = `${supplierTabs.length} supplier${supplierTabs.length !== 1 ? 's' : ''}`;
 
-  // Sort
+  // Sort + search filter
   const statusOrder = { Approve: 0, Escalate: 1, null: 2, undefined: 2, Reject: 3 };
+  const q = listSearchQuery.toLowerCase().trim();
   const sorted = supplierTabs
     .map((tab, i) => ({ ...tab, _origIdx: i }))
+    .filter(tab => !q || (tab.name || '').toLowerCase().includes(q))
     .sort((a, b) => {
       let cmp = 0;
       if (sortKey === 'date') {
@@ -1100,6 +1267,12 @@ function renderSupplierList() {
       }
       return sortDir === 'asc' ? -cmp : cmp;
     });
+
+  if (!sorted.length && q) {
+    wrap.innerHTML = `<div class="list-no-results">No suppliers match "<strong>${escHtml(q)}</strong>"</div>`;
+    renderStatusChart();
+    return;
+  }
 
   wrap.innerHTML = sorted.map(tab => {
     const decision    = tab.decision || 'Pending';
@@ -1192,6 +1365,12 @@ function renderSupplierList() {
     btn.classList.toggle('desc', isActive && sortDir === 'desc');
     btn.classList.toggle('asc',  isActive && sortDir === 'asc');
   });
+
+  // Sync search input value
+  const searchInput = document.getElementById('listSearch');
+  if (searchInput && searchInput.value !== listSearchQuery) searchInput.value = listSearchQuery;
+
+  renderStatusChart();
 }
 
 // ── Upload modal ──────────────────────────────────────────────────────────────
@@ -1249,7 +1428,7 @@ function buildConcernsReportForTab(tab) {
     items.forEach(text => {
       if (text && text.trim()) {
         concerns.push({ dimension: dim.label, text: text.trim(),
-          severity: getSeverity(score), dimScore: score });
+          severity: getSeverityFromText(text.trim(), score), dimScore: score });
       }
     });
   });
@@ -1303,7 +1482,13 @@ function loadTab(idx) {
     document.getElementById(dim.val1).textContent = [tab.f, tab.a, tab.c, tab.g][i];
   });
 
-  renderCard({ name: tab.name, score: tab.score, subScores: tab.subScores, explainText: tab.explainText, f: tab.f, a: tab.a, c: tab.c, g: tab.g });
+  renderCard({
+    name:        tab.name,
+    score:       tab.addressedScore       ?? tab.score,
+    subScores:   tab.addressedSubScores   ?? tab.subScores,
+    explainText: tab.addressedExplainText ?? tab.explainText,
+    f: tab.f, a: tab.a, c: tab.c, g: tab.g,
+  });
 
   const banner = document.getElementById('decisionBanner');
   if (tab.decision) {
@@ -1322,6 +1507,7 @@ function loadTab(idx) {
   document.getElementById('uploadStatus').textContent = '';
 
   renderSourceDocs(tab.sourceDocs || []);
+  setSliderAiMode(tab.evidence ? true : false, (tab.sourceDocs || []).length);
   setAiNotice(false);
 
   // Restore evidence if this tab had it
@@ -1334,6 +1520,7 @@ function loadTab(idx) {
     document.getElementById('concernsSection').classList.add('hidden');
   }
 
+  renderScoreHistory(tab);
   renderTabs();
 }
 
@@ -1394,6 +1581,11 @@ function resetMainScreen() {
   document.getElementById('confidenceLabel').textContent = '';
   document.getElementById('confidenceLabel').className   = 'confidence-label';
 
+  const _shtoggle = document.getElementById('scoreHistoryToggle');
+  const _shlist   = document.getElementById('scoreHistoryList');
+  if (_shtoggle) { _shtoggle.classList.add('hidden'); _shtoggle.setAttribute('aria-expanded', 'false'); }
+  if (_shlist)   { _shlist.classList.add('hidden'); _shlist.innerHTML = ''; }
+
   const ring = document.getElementById('scoreRing');
   const circumference = 2 * Math.PI * 54;
   ring.style.strokeDasharray  = circumference;
@@ -1411,6 +1603,7 @@ function resetMainScreen() {
   document.getElementById('uploadStatus').textContent = '';
 
   renderSourceDocs([]);
+  setSliderAiMode(false);
   setAiNotice(false);
   hideLoader();
   document.getElementById('evidenceSection').classList.add('hidden');
@@ -1567,12 +1760,14 @@ async function handleBeginAssessment() {
   }
 
   hideLoader();
+  setSliderAiMode(true, fileNames.length);
 
   const initialScore  = compositeRuleBased(f, a, c, g);
   const concernsCount = hasEvidence
     ? buildConcernsReportForTab({ evidence: parsed, f, a, c, g }).length
     : 0;
 
+  const MAX_RAW_CHARS = 14000;
   saveTabAt(myTabIdx, {
     name:         extractedName,
     score:        initialScore,
@@ -1581,6 +1776,12 @@ async function handleBeginAssessment() {
     sourceDocs:   [...fileNames],
     evidence:     currentEvidence ? { ...currentEvidence } : null,
     concernsCount,
+    rawDocTexts:  rawTexts.map(({ text, fileName }) => ({
+      fileName,
+      text: text.length > MAX_RAW_CHARS
+        ? text.slice(0, MAX_RAW_CHARS) + '\n\n[Document truncated — showing first ~4 pages]'
+        : text,
+    })),
   });
 
   currentTabIdx = myTabIdx;
@@ -1626,6 +1827,23 @@ function errorLoader(msg) {
   document.getElementById('loadingText').textContent = msg;
 }
 
+function setSliderAiMode(on, docCount) {
+  const panel = document.getElementById('sliderPanel');
+  const bar   = document.getElementById('aiModeBar');
+  const label = document.getElementById('aiModeLabel');
+  if (!panel || !bar) return;
+  if (on) {
+    panel.classList.add('ai-assessed');
+    bar.classList.remove('hidden');
+    if (label && docCount != null) {
+      label.textContent = `AI-assessed · ${docCount} document${docCount !== 1 ? 's' : ''}`;
+    }
+  } else {
+    panel.classList.remove('ai-assessed');
+    bar.classList.add('hidden');
+  }
+}
+
 function setAiNotice(show) {
   let el = document.getElementById('aiNotice');
   if (!el) {
@@ -1636,6 +1854,25 @@ function setAiNotice(show) {
   }
   el.textContent = show ? 'AI unavailable — using rule-based scoring' : '';
   el.classList.toggle('hidden', !show);
+}
+
+function showToast(message, linkText, linkFn, duration = 5000) {
+  const container = document.getElementById('toastContainer');
+  if (!container) return;
+  const toast = document.createElement('div');
+  toast.className = 'toast';
+  toast.innerHTML = `<span class="toast-msg">${escHtml(message)}</span>` +
+    (linkText ? `<button class="toast-link" type="button">${escHtml(linkText)}</button>` : '');
+  if (linkText && linkFn) {
+    toast.querySelector('.toast-link').addEventListener('click', () => { linkFn(); toast.remove(); });
+  }
+  container.appendChild(toast);
+  const dismiss = () => {
+    toast.style.opacity = '0';
+    toast.style.transition = 'opacity 0.2s';
+    setTimeout(() => toast.remove(), 220);
+  };
+  setTimeout(dismiss, duration);
 }
 
 function renderCard({ name, score, subScores, explainText, f, a, c, g }) {
@@ -1657,6 +1894,7 @@ function renderCard({ name, score, subScores, explainText, f, a, c, g }) {
   const confEl = document.getElementById('confidenceLabel');
   confEl.textContent = conf.label;
   confEl.className   = 'confidence-label ' + conf.cls;
+  confEl.title       = 'Reflects how consistent the 4 dimension scores are. Variable = scores differ significantly across areas — examine each dimension individually.';
 
   updateActionButtons(t.cls);
 
@@ -1766,6 +2004,15 @@ async function runUpdate() {
       explainText: explainText.trim(),
       f, a, c, g,
     });
+    const _snapTrigger = (supplierTabs[myTabIdx]?.scoreHistory?.length ?? 0) === 0
+      ? 'Initial assessment' : 'Score updated';
+    pushScoreSnapshot(myTabIdx, {
+      score: scoreData.score,
+      subScores: { financial: scoreData.financial, audit: scoreData.audit, compliance: scoreData.compliance, geo: scoreData.geo },
+      explainText: explainText.trim(),
+      trigger: _snapTrigger,
+    });
+    if (currentTabIdx === myTabIdx) renderScoreHistory(supplierTabs[myTabIdx]);
 
   } catch (err) {
     if (signal.aborted) return;
@@ -1778,6 +2025,15 @@ async function runUpdate() {
       renderCard({ name, score, subScores: null, explainText, f, a, c, g });
     }
     saveTabAt(myTabIdx, { name, score, tierCls: tier(score).cls, subScores: null, explainText, f, a, c, g });
+    const _fbTrigger = (supplierTabs[myTabIdx]?.scoreHistory?.length ?? 0) === 0
+      ? 'Initial assessment (rule-based)' : 'Score updated (rule-based)';
+    pushScoreSnapshot(myTabIdx, {
+      score,
+      subScores: { financial: f, audit: a, compliance: c, geo: g },
+      explainText,
+      trigger: _fbTrigger,
+    });
+    if (currentTabIdx === myTabIdx) renderScoreHistory(supplierTabs[myTabIdx]);
   }
 }
 
@@ -1793,6 +2049,7 @@ function updateActionButtons(tierCls) {
 }
 
 function recordDecision(decision) {
+  const extraData = {};
   const name      = document.getElementById('cardName').textContent;
   const note      = document.getElementById('spocNotes').value.trim();
   const score     = +document.getElementById('compositeScore').textContent;
@@ -1813,7 +2070,24 @@ function recordDecision(decision) {
   setDecisionButtonsDisabled(true);
   document.getElementById('btnReset').classList.remove('hidden');
 
-  appendHistory({ name, score, tierLabel, tierCls, decision, note, fullTs });
+  const currentTab = currentTabIdx >= 0 ? supplierTabs[currentTabIdx] : null;
+  const addressedAtDecision = currentTab ? Object.values(currentTab.addressedConcerns || {}) : [];
+
+  appendHistory({ name, score, tierLabel, tierCls, decision, note, fullTs,
+    approvedBecause:    extraData.approvedBecause || null,
+    approvalDocName:    extraData.approvalDocName || null,
+    addressedConcerns:  addressedAtDecision,
+    tabIdx:             currentTabIdx,
+  });
+
+  showToast(`${decision} recorded — ${fullTs}`, 'View record ↓', () => {
+    const firstRow = document.getElementById('historyBody')?.firstElementChild;
+    if (firstRow) {
+      firstRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      firstRow.classList.add('h-row-highlight');
+      setTimeout(() => firstRow.classList.remove('h-row-highlight'), 1600);
+    }
+  });
 
   const f = +document.getElementById('financial').value;
   const a = +document.getElementById('audit').value;
@@ -1826,26 +2100,105 @@ function recordDecision(decision) {
     sourceDocs:  [...activeSourceDocs],
     evidence:    currentEvidence ? { ...currentEvidence } : null,
     decision, notes: note, bannerText, fullTs,
+    approvedBecause: extraData.approvedBecause || null,
+    approvalDocName: extraData.approvalDocName || null,
     subScores:   lastRenderData ? lastRenderData.subScores : null,
     explainText: document.getElementById('explainText').textContent,
   });
+
+  // Record this decision as a score-history snapshot
+  pushScoreSnapshot(currentTabIdx, {
+    score,
+    subScores: lastRenderData ? lastRenderData.subScores : null,
+    explainText: document.getElementById('explainText').textContent,
+    trigger: `Decision: ${decision}`,
+  });
+  renderScoreHistory(supplierTabs[currentTabIdx]);
+
   renderSupplierList();
 }
 
 function resetDecision() {
-  const banner = document.getElementById('decisionBanner');
-  banner.className   = 'decision-banner hidden';
-  banner.textContent = '';
-  document.getElementById('spocNotes').value = '';
-  setDecisionButtonsDisabled(false);
-  document.getElementById('btnReset').classList.add('hidden');
-  updateCard();
+  const name = document.getElementById('cardName').textContent;
+  confirmModal({
+    title:        'Reset decision?',
+    body:         `This will clear the recorded decision for "${name}" and re-open the approval options.`,
+    confirmLabel: 'Reset',
+    icon:         '↩',
+    onConfirm() {
+      const banner = document.getElementById('decisionBanner');
+      banner.className   = 'decision-banner hidden';
+      banner.textContent = '';
+      document.getElementById('spocNotes').value = '';
+      setDecisionButtonsDisabled(false);
+      document.getElementById('btnReset').classList.add('hidden');
+      updateCard();
+    },
+  });
 }
 
 // ── Per-concern addressed ─────────────────────────────────────────────────────
 
 function concernKey(text) {
   return text.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '').slice(0, 60);
+}
+
+// Recalculate dimension scores and composite after concerns are addressed.
+// Returns { adjustedSubScores, newScore, oldScore, dimChanges } or null if no evidence.
+function recalcScoreAfterAddressed(tab) {
+  if (!tab || !tab.evidence) return null;
+
+  const addressed  = tab.addressedConcerns || {};
+  const baseScores = { financial: tab.f || 0, audit: tab.a || 0, compliance: tab.c || 0, geo: tab.g || 0 };
+  const adjustedSubScores = {};
+  const dimChanges = [];
+
+  DIM_META.forEach(dim => {
+    const concerns = (tab.evidence[dim.id + '_concerns'] || []).filter(t => t && t.trim());
+    const base     = baseScores[dim.id];
+    if (!concerns.length) {
+      adjustedSubScores[dim.id] = base;
+      return;
+    }
+    const addressedCount = concerns.filter(t => !!addressed[concernKey(t.trim())]).length;
+    const ratio  = addressedCount / concerns.length;
+    const boost  = Math.round(ratio * (100 - base) * 0.4);
+    const adj    = Math.min(100, base + boost);
+    adjustedSubScores[dim.id] = adj;
+    if (boost > 0) dimChanges.push({ label: dim.label, base, adj, boost, addressedCount, total: concerns.length });
+  });
+
+  const oldScore = compositeRuleBased(tab.f || 0, tab.a || 0, tab.c || 0, tab.g || 0);
+  const newScore = compositeRuleBased(
+    adjustedSubScores.financial, adjustedSubScores.audit,
+    adjustedSubScores.compliance, adjustedSubScores.geo,
+  );
+
+  return { adjustedSubScores, newScore, oldScore, dimChanges };
+}
+
+// Build a plain-text explanation summarising the score change due to addressed concerns.
+function buildAddressedExplainText(tab, recalc, newlyAddressedTexts) {
+  const { dimChanges, newScore, oldScore } = recalc;
+  const totalAddressed = Object.keys(tab.addressedConcerns || {}).length;
+  const parts = [];
+
+  if (dimChanges.length) {
+    const dimList = dimChanges.map(d => `${d.label} (${d.base}→${d.adj})`).join(', ');
+    parts.push(
+      `${totalAddressed} concern${totalAddressed !== 1 ? 's' : ''} addressed, ` +
+      `improving ${dimList}.`
+    );
+  }
+  if (newScore !== oldScore) {
+    parts.push(`Composite score adjusted from ${oldScore} to ${newScore}.`);
+  }
+  if (newlyAddressedTexts && newlyAddressedTexts.length) {
+    const snippet = parseConcernSnippet(newlyAddressedTexts[0]);
+    parts.push(`Most recently addressed: "${snippet.length > 90 ? snippet.slice(0, 90) + '…' : snippet}".`);
+  }
+
+  return parts.length ? parts.join(' ') : (tab.explainText || '');
 }
 
 
@@ -1864,12 +2217,14 @@ function refreshConcernsBadge() {
 }
 
 function updateMarkSelectedBtn() {
-  const btn      = document.getElementById('btnMarkSelected');
-  const countEl  = document.getElementById('markSelectedCount');
+  const btn     = document.getElementById('btnMarkSelected');
+  const countEl = document.getElementById('markSelectedCount');
+  const hintEl  = document.getElementById('markSelectedHint');
   if (!btn) return;
   const checked = document.querySelectorAll('.concern-check:checked').length;
   btn.disabled = checked === 0;
   countEl.textContent = checked > 0 ? `(${checked})` : '';
+  if (hintEl) hintEl.style.display = checked > 0 ? '' : 'none';
 }
 
 function markSelectedConcernsAddressed() {
@@ -1877,35 +2232,148 @@ function markSelectedConcernsAddressed() {
   const checked = Array.from(document.querySelectorAll('.concern-check:checked'));
   if (!checked.length) return;
 
-  const now = new Date();
-  const ts  = now.toLocaleDateString([], { day: '2-digit', month: 'short', year: 'numeric' }) +
-              ', ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  // Gate behind the approval modal — reason + supporting document required
+  showApprovalModal(({ approvedBecause, approvalDocName }) => {
+    const now = new Date();
+    const ts  = now.toLocaleDateString([], { day: '2-digit', month: 'short', year: 'numeric' }) +
+                ', ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
-  const tab = supplierTabs[currentTabIdx];
-  const updated = { ...(tab.addressedConcerns || {}) };
+    const tab     = supplierTabs[currentTabIdx];
+    const updated = { ...(tab.addressedConcerns || {}) };
+    const newlyAddressedTexts = [];
 
-  checked.forEach(cb => {
-    const key = cb.dataset.key;
-    const row = cb.closest('.concern-row');
-    if (!row || updated[key]) return;
-    // Derive concern metadata from the DOM row
-    const text = row.querySelector('.concern-text')?.textContent || '';
-    const dimension = row.querySelector('.concern-dim')?.textContent || '';
-    const sev = row.querySelector('.sev-badge')?.textContent || 'LOW';
-    updated[key] = { ts, text, dimension, severity: sev };
+    checked.forEach(cb => {
+      const key = cb.dataset.key;
+      const row = cb.closest('.concern-row');
+      if (!row || updated[key]) return;
+      const text      = row.querySelector('.concern-text')?.textContent || '';
+      const dimension = row.querySelector('.concern-dim')?.textContent  || '';
+      const sev       = row.querySelector('.sev-badge')?.textContent    || 'LOW';
+      updated[key]    = { ts, text, dimension, severity: sev, approvedBecause, approvalDocName };
+      newlyAddressedTexts.push(text);
+    });
+
+    // Persist addressed map first so recalc can read it
+    saveCurrentTab({ addressedConcerns: updated });
+
+    // Recalculate score based on how many concerns are now addressed
+    const updatedTab = supplierTabs[currentTabIdx];
+    const recalc     = recalcScoreAfterAddressed(updatedTab);
+
+    if (recalc) {
+      const newExplain = buildAddressedExplainText(updatedTab, recalc, newlyAddressedTexts);
+      saveCurrentTab({
+        addressedScore:       recalc.newScore,
+        addressedSubScores:   recalc.adjustedSubScores,
+        addressedExplainText: newExplain,
+      });
+
+      // Snapshot: record what changed and why
+      const triggerText = newlyAddressedTexts.length
+        ? `Concern addressed: "${newlyAddressedTexts[0].length > 60 ? newlyAddressedTexts[0].slice(0, 60) + '…' : newlyAddressedTexts[0]}"`
+        : 'Concern addressed';
+      pushScoreSnapshot(currentTabIdx, { score: recalc.newScore, subScores: recalc.adjustedSubScores, explainText: newExplain, trigger: triggerText });
+
+      // Update the card display without triggering a new AI call
+      const finalTab = supplierTabs[currentTabIdx];
+      renderCard({
+        name:        document.getElementById('cardName').textContent,
+        score:       recalc.newScore,
+        subScores:   recalc.adjustedSubScores,
+        explainText: newExplain,
+        f: finalTab.f, a: finalTab.a, c: finalTab.c, g: finalTab.g,
+      });
+      renderScoreHistory(finalTab);
+    }
+
+    // Rebuild concerns list + evidence panel to reflect addressed state
+    if (currentEvidence) {
+      renderConcernsReport(buildConcernsReport(currentEvidence));
+      renderEvidencePanel(currentEvidence, activeSourceDocs);
+    }
+    refreshConcernsBadge();
+    renderSupplierList();
   });
+}
 
-  saveCurrentTab({ addressedConcerns: updated });
+// ── Score history ─────────────────────────────────────────────────────────────
 
-  // Rebuild the concerns list to reflect new state
-  if (currentEvidence) renderConcernsReport(buildConcernsReport(currentEvidence));
-  refreshConcernsBadge();
-  renderSupplierList();
+function nowTs() {
+  const now = new Date();
+  return now.toLocaleDateString([], { day: '2-digit', month: 'short', year: 'numeric' }) +
+         ', ' + now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function pushScoreSnapshot(idx, { score, subScores, explainText, trigger }) {
+  if (idx < 0 || idx >= supplierTabs.length) return;
+  const tab     = supplierTabs[idx];
+  const history = Array.isArray(tab.scoreHistory) ? [...tab.scoreHistory] : [];
+  // Skip only if score, explanation AND trigger are all identical to the last entry
+  const last = history[history.length - 1];
+  if (last && last.score === score && last.explainText === explainText && last.trigger === trigger) return;
+  history.push({
+    score,
+    subScores: subScores || null,
+    explainText: explainText || '—',
+    ts:      nowTs(),
+    trigger: trigger || 'Score updated',
+  });
+  supplierTabs[idx] = { ...supplierTabs[idx], scoreHistory: history };
+  saveTabsToStorage();
+}
+
+function renderScoreHistory(tab) {
+  const toggle  = document.getElementById('scoreHistoryToggle');
+  const list    = document.getElementById('scoreHistoryList');
+  const label   = document.getElementById('scoreHistoryLabel');
+  if (!toggle || !list) return;
+
+  const history = tab && Array.isArray(tab.scoreHistory) ? tab.scoreHistory : [];
+  if (history.length < 1) {
+    toggle.classList.add('hidden');
+    list.classList.add('hidden');
+    return;
+  }
+
+  label.textContent = `Score history (${history.length})`;
+  toggle.classList.remove('hidden');
+
+  // Render most-recent-first; mark the last entry as "current"
+  const reversed = [...history].reverse();
+  list.innerHTML = reversed.map((entry, i) => {
+    const isCurrent = i === 0;
+    const tierCls   = entry.score >= 70 ? '#16a34a' : entry.score >= 40 ? '#d97706' : '#dc2626';
+
+    const dimRow = entry.subScores
+      ? `<div class="sh-dim-row">` +
+        DIM_META.map(d => {
+          const v = entry.subScores[d.id] ?? '—';
+          const c = typeof v === 'number' ? (v >= 70 ? '#16a34a' : v >= 40 ? '#d97706' : '#dc2626') : '#94a3b8';
+          const wt = Math.round(d.weight * 100) + '%';
+          return `<span class="sh-dim">` +
+            `<span class="sh-dim-label">${d.label.split(' ')[0]} <span style="font-weight:400;opacity:.7">${wt}</span></span>` +
+            `<span class="sh-dim-val" style="color:${c}">${v}</span>` +
+            `</span>`;
+        }).join('') +
+        `</div>`
+      : '';
+
+    return `<div class="sh-entry${isCurrent ? ' sh-current' : ''}" role="listitem">` +
+      `<div class="sh-entry-header">` +
+      `<span class="sh-score-badge" style="color:${tierCls}">Score ${entry.score}</span>` +
+      (isCurrent ? `<span class="sh-current-label">Current</span>` : '') +
+      `<span class="sh-trigger">${escHtml(entry.trigger)}</span>` +
+      `<span class="sh-ts">${escHtml(entry.ts)}</span>` +
+      `</div>` +
+      dimRow +
+      `<p class="sh-explain">${escHtml(entry.explainText)}</p>` +
+      `</div>`;
+  }).join('');
 }
 
 // ── Decision history ──────────────────────────────────────────────────────────
 
-function appendHistory({ name, score, tierLabel, tierCls, decision, note, fullTs, detail }) {
+function appendHistory({ name, score, tierLabel, tierCls, decision, note, fullTs, detail, approvedBecause, approvalDocName, addressedConcerns, tabIdx }) {
   document.getElementById('historyEmpty').classList.add('hidden');
   const table = document.getElementById('historyTable');
   table.classList.remove('hidden');
@@ -1913,27 +2381,65 @@ function appendHistory({ name, score, tierLabel, tierCls, decision, note, fullTs
   const decisionCls = { Approve: 'dec-approve', Escalate: 'dec-escalate', Reject: 'dec-reject' }[decision] || '';
   const tbody = document.getElementById('historyBody');
 
+  const hasDetail = detail || approvedBecause || approvalDocName || (addressedConcerns && addressedConcerns.length > 0);
   const tr = document.createElement('tr');
-  if (detail) tr.classList.add('h-expandable');
+  if (hasDetail) tr.classList.add('h-expandable');
   tr.innerHTML =
     `<td class="h-name">${escHtml(name)}</td>` +
     `<td class="h-score">${score}</td>` +
     `<td><span class="tier-badge ${tierCls}">${escHtml(tierLabel)}</span></td>` +
     `<td><span class="history-decision ${decisionCls}">${escHtml(decision)}</span></td>` +
     `<td class="h-note">${note ? escHtml(note) : '<span class="h-empty">—</span>'}</td>` +
-    `<td class="h-ts">${escHtml(fullTs)}${detail ? ' <span class="h-expand-toggle" aria-hidden="true">▶</span>' : ''}</td>`;
+    `<td class="h-ts">${escHtml(fullTs)}${hasDetail ? ' <span class="h-expand-toggle" aria-hidden="true">▶</span>' : ''}</td>`;
 
-  if (detail) {
-    const sevCls = { HIGH: 'sev-high', MEDIUM: 'sev-medium', LOW: 'sev-low' }[detail.severity] || '';
+  if (hasDetail) {
     const detailTr = document.createElement('tr');
     detailTr.className = 'h-detail-row hidden';
-    detailTr.innerHTML =
-      `<td colspan="6"><div class="h-detail-content">` +
-      `<span class="h-detail-heading">Concerns Addressed</span>` +
-      `<span class="concern-dim">${escHtml(detail.dimension)}</span>` +
-      `<span class="sev-badge ${sevCls}">${escHtml(detail.severity)}</span>` +
-      `<p class="h-detail-text">${escHtml(detail.text)}</p>` +
-      `</div></td>`;
+
+    let detailContent = '<div class="h-detail-content">';
+    if (approvedBecause) {
+      detailContent +=
+        `<span class="h-detail-heading">Approved Because</span>` +
+        `<p class="h-detail-text">${escHtml(approvedBecause)}</p>`;
+    }
+    if (approvalDocName) {
+      detailContent +=
+        `<span class="h-detail-heading" style="margin-top:8px">Supporting Document</span>` +
+        `<p class="h-detail-text h-doc-ref">📎 ${escHtml(approvalDocName)}</p>`;
+    }
+    if (detail) {
+      const sevCls = { HIGH: 'sev-high', MEDIUM: 'sev-medium', LOW: 'sev-low' }[detail.severity] || '';
+      detailContent +=
+        `<span class="h-detail-heading">Concerns Addressed</span>` +
+        `<span class="concern-dim">${escHtml(detail.dimension)}</span>` +
+        `<span class="sev-badge ${sevCls}">${escHtml(detail.severity)}</span>` +
+        `<p class="h-detail-text">${escHtml(detail.text)}</p>`;
+    }
+    if (addressedConcerns && addressedConcerns.length > 0) {
+      detailContent += `<div class="h-detail-concerns">` +
+        `<span class="h-detail-heading">Concerns Addressed (${addressedConcerns.length})</span>`;
+      addressedConcerns.forEach(c => {
+        const sc = { HIGH: 'sev-high', MEDIUM: 'sev-medium', LOW: 'sev-low' }[c.severity] || '';
+        detailContent +=
+          `<div class="h-concern-item">` +
+          `<span class="sev-badge ${sc}">${escHtml(c.severity || 'LOW')}</span>` +
+          `<span class="concern-dim">${escHtml(c.dimension || '')}</span>` +
+          `<button class="h-concern-link" type="button" data-concern="${escHtml(c.text)}" data-tabidx="${tabIdx ?? -1}">${escHtml(c.text)}</button>` +
+          `</div>`;
+      });
+      detailContent += `</div>`;
+    }
+    detailContent += '</div>';
+    detailTr.innerHTML = `<td colspan="6">${detailContent}</td>`;
+
+    // Wire clickable concerns to document viewer
+    detailTr.querySelectorAll('.h-concern-link').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        const tidx = +btn.dataset.tabidx;
+        openDocViewer(btn.dataset.concern, tidx >= 0 ? tidx : currentTabIdx);
+      });
+    });
 
     tr.addEventListener('click', () => {
       const isOpen = !detailTr.classList.contains('hidden');
@@ -1942,12 +2448,104 @@ function appendHistory({ name, score, tierLabel, tierCls, decision, note, fullTs
       if (arrow) arrow.textContent = isOpen ? '▶' : '▼';
     });
 
-    // Insert main row first, detail row immediately after
     tbody.insertBefore(detailTr, tbody.firstChild);
     tbody.insertBefore(tr, detailTr);
   } else {
     tbody.insertBefore(tr, tbody.firstChild);
   }
+}
+
+// ── Document viewer ───────────────────────────────────────────────────────────
+
+function parseConcernFileName(concernText) {
+  const m = concernText.match(/\(([^()]+\.(pdf|docx))\)\s*$/i);
+  return m ? m[1] : null;
+}
+
+function parseConcernSnippet(concernText) {
+  return concernText.replace(/\s*\([^()]+\.(pdf|docx)\)\s*$/i, '').trim();
+}
+
+function findSnippetIndex(snippet, rawText) {
+  // Try matching the first 10 words with flexible whitespace
+  const words = snippet.replace(/\s+/g, ' ').trim().split(/\s+/).slice(0, 10);
+  if (!words.length) return -1;
+  const pattern = words
+    .map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('[\\s\\S]{0,6}');
+  try {
+    const m = rawText.match(new RegExp(pattern, 'i'));
+    return m ? m.index : -1;
+  } catch { return -1; }
+}
+
+function openDocViewer(concernText, tabIdx) {
+  const tidx = tabIdx ?? currentTabIdx;
+  const tab  = tidx >= 0 && tidx < supplierTabs.length ? supplierTabs[tidx] : null;
+
+  const fileName = parseConcernFileName(concernText);
+  const snippet  = parseConcernSnippet(concernText);
+
+  const rawDocs  = tab ? (tab.rawDocTexts || []) : [];
+  const rawDoc   = fileName
+    ? rawDocs.find(d => d.fileName === fileName) || rawDocs[0]
+    : rawDocs[0];
+
+  const modal    = document.getElementById('docViewerModal');
+  const titleEl  = document.getElementById('docViewerTitle');
+  const snippetEl = document.getElementById('docViewerSnippet');
+  const bodyEl   = document.getElementById('docViewerBody');
+
+  titleEl.textContent = fileName || (rawDoc ? rawDoc.fileName : 'Source Document');
+
+  if (!rawDoc) {
+    snippetEl.textContent = `"${snippet}"`;
+    snippetEl.classList.remove('hidden');
+    bodyEl.innerHTML =
+      `<p style="color:#64748b;font-size:13px;">` +
+      `Document text is not available for this supplier. ` +
+      `Re-run the assessment to enable in-document viewing.` +
+      `</p>`;
+  } else {
+    const rawText = rawDoc.text;
+    const idx = findSnippetIndex(snippet, rawText);
+
+    if (idx >= 0) {
+      snippetEl.classList.add('hidden');
+      // Find the actual match length using a smaller regex
+      const firstWords = snippet.replace(/\s+/g, ' ').trim().split(/\s+/).slice(0, 6);
+      const shortPat = firstWords
+        .map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+        .join('[\\s\\S]{0,6}');
+      let matchLen = snippet.length;
+      try {
+        const m2 = rawText.slice(idx, idx + snippet.length + 80).match(new RegExp(shortPat, 'i'));
+        if (m2) matchLen = m2[0].length;
+      } catch { /* use default */ }
+
+      const before  = escHtml(rawText.slice(0, idx));
+      const matched = escHtml(rawText.slice(idx, idx + matchLen));
+      const after   = escHtml(rawText.slice(idx + matchLen));
+      bodyEl.innerHTML =
+        `<pre class="doc-viewer-pre">${before}<mark class="doc-viewer-mark">${matched}</mark>${after}</pre>`;
+      setTimeout(() => {
+        const mark = bodyEl.querySelector('mark');
+        if (mark) mark.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 60);
+    } else {
+      snippetEl.textContent = `Cited passage: "${snippet}"`;
+      snippetEl.classList.remove('hidden');
+      bodyEl.innerHTML = `<pre class="doc-viewer-pre">${escHtml(rawText)}</pre>`;
+    }
+  }
+
+  modal.classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+}
+
+function closeDocViewer() {
+  document.getElementById('docViewerModal').classList.add('hidden');
+  document.body.style.overflow = '';
 }
 
 function escHtml(str) {
@@ -1988,6 +2586,83 @@ function initTooltips() {
 
     zone.addEventListener('mouseleave', () => tooltip.classList.add('hidden'));
   });
+}
+
+// ── Approval modal ────────────────────────────────────────────────────────────
+
+let _approvalDocFile = null;
+
+// onConfirm receives { approvedBecause, approvalDocName } when the reviewer confirms.
+function showApprovalModal(onConfirm) {
+  const modal    = document.getElementById('approvalModal');
+  const titleEl  = document.getElementById('approvalModalTitle');
+  const textarea = document.getElementById('approvedBecauseField');
+  const docInput = document.getElementById('approvalDocInput');
+  const docChip  = document.getElementById('approvalDocChip');
+  const validMsg = document.getElementById('approvalValidationMsg');
+  const backdrop = document.getElementById('approvalModalBackdrop');
+  const cancelBtn  = document.getElementById('approvalModalCancel');
+  const confirmBtn = document.getElementById('approvalModalConfirm');
+
+  titleEl.textContent = 'Approve Concern(s)';
+
+  // Reset state
+  textarea.value = '';
+  docInput.value = '';
+  _approvalDocFile = null;
+  docChip.classList.add('hidden');
+  docChip.innerHTML = '';
+  validMsg.classList.add('hidden');
+
+  modal.classList.remove('hidden');
+  document.body.style.overflow = 'hidden';
+  textarea.focus();
+
+  function close() {
+    modal.classList.add('hidden');
+    document.body.style.overflow = '';
+    _approvalDocFile = null;
+    confirmBtn.removeEventListener('click', handleConfirm);
+    cancelBtn.removeEventListener('click', close);
+    backdrop.removeEventListener('click', close);
+    document.removeEventListener('keydown', handleKey);
+    docInput.removeEventListener('change', handleDocChange);
+  }
+
+  function handleDocChange() {
+    const file = docInput.files[0];
+    if (!file) return;
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (ext !== 'pdf' && ext !== 'docx') { docInput.value = ''; return; }
+    _approvalDocFile = file;
+    docChip.classList.remove('hidden');
+    docChip.innerHTML =
+      `<span>📎 ${escHtml(file.name)}</span>` +
+      `<button class="approval-doc-chip-remove" type="button" aria-label="Remove">✕</button>`;
+    docChip.querySelector('.approval-doc-chip-remove').addEventListener('click', () => {
+      _approvalDocFile = null;
+      docInput.value   = '';
+      docChip.classList.add('hidden');
+      docChip.innerHTML = '';
+    });
+  }
+
+  function handleConfirm() {
+    const reason  = textarea.value.trim();
+    const docName = _approvalDocFile ? _approvalDocFile.name : null;
+    if (!reason || !docName) { validMsg.classList.remove('hidden'); return; }
+    validMsg.classList.add('hidden');
+    close();
+    onConfirm({ approvedBecause: reason, approvalDocName: docName });
+  }
+
+  function handleKey(e) { if (e.key === 'Escape') close(); }
+
+  confirmBtn.addEventListener('click', handleConfirm);
+  cancelBtn.addEventListener('click', close);
+  backdrop.addEventListener('click', close);
+  document.addEventListener('keydown', handleKey);
+  docInput.addEventListener('change', handleDocChange);
 }
 
 // ── Upload modal wiring ───────────────────────────────────────────────────────
@@ -2062,6 +2737,16 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btnReset').addEventListener('click', resetDecision);
   document.getElementById('btnExport').addEventListener('click', () => window.print());
 
+  // Score history toggle
+  document.getElementById('scoreHistoryToggle').addEventListener('click', () => {
+    const list   = document.getElementById('scoreHistoryList');
+    const toggle = document.getElementById('scoreHistoryToggle');
+    const arrow  = document.getElementById('scoreHistoryArrow');
+    const open   = list.classList.toggle('hidden') === false;
+    toggle.setAttribute('aria-expanded', String(open));
+    arrow.style.transform = open ? 'rotate(90deg)' : '';
+  });
+
   // Detail view: back to list
   document.getElementById('btnBackToList').addEventListener('click', () => {
     clearTimeout(debounceTimer);
@@ -2079,6 +2764,24 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // List page: + New Supplier
   document.getElementById('btnNewSupplierGlobal').addEventListener('click', showUploadModal);
+
+  // List page: live supplier search
+  const listSearchEl = document.getElementById('listSearch');
+  if (listSearchEl) {
+    listSearchEl.addEventListener('input', () => {
+      listSearchQuery = listSearchEl.value;
+      renderSupplierList();
+    });
+    const listSearchClear = document.getElementById('listSearchClear');
+    if (listSearchClear) {
+      listSearchClear.addEventListener('click', () => {
+        listSearchQuery = '';
+        listSearchEl.value = '';
+        listSearchEl.focus();
+        renderSupplierList();
+      });
+    }
+  }
 
   // List page: sort buttons
   document.querySelectorAll('.sort-btn').forEach(btn => {
@@ -2107,6 +2810,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     exportConcernsLetter(name === '—' ? 'Supplier' : name, concerns);
   });
+
+  // Document viewer modal wiring
+  document.getElementById('docViewerClose').addEventListener('click', closeDocViewer);
+  document.getElementById('docViewerBackdrop').addEventListener('click', closeDocViewer);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !document.getElementById('docViewerModal').classList.contains('hidden')) {
+      closeDocViewer();
+    }
+  });
+
+  // App version label
+  const verEl = document.getElementById('appVersion');
+  if (verEl) verEl.textContent = APP_VERSION;
 
   initTooltips();
   initUploadModal();
